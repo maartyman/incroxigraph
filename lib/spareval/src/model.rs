@@ -76,34 +76,22 @@ impl<'a> From<SliceQueryResultsParserOutput<'a>> for QueryResults<'a> {
 /// }
 /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
 /// ```
-pub struct QuerySolutionIter<'a> {
+pub struct QuerySolutionIter<'a, T = QuerySolution> {
     variables: Arc<[Variable]>,
-    iter: Box<dyn Iterator<Item = Result<QuerySolution, QueryEvaluationError>> + 'a>,
+    iter: Box<dyn Iterator<Item = Result<T, QueryEvaluationError>> + 'a>,
 }
 
-impl<'a> QuerySolutionIter<'a> {
+impl<'a, T> QuerySolutionIter<'a, T> {
     /// Construct a new iterator of solutions from an ordered list of solution variables and an iterator of solutions
-    pub fn new(
-        variables: Arc<[Variable]>,
-        iter: impl IntoIterator<Item = Result<QuerySolution, QueryEvaluationError>> + 'a,
-    ) -> Self {
+    pub fn new<I>(variables: Arc<[Variable]>, iter: I) -> Self
+    where
+        I: IntoIterator<Item = Result<T, QueryEvaluationError>>,
+        I::IntoIter: 'a,
+    {
         Self {
             variables,
             iter: Box::new(iter.into_iter()),
         }
-    }
-
-    /// Construct a new iterator of solutions from an ordered list of solution variables and an iterator of solution tuples
-    /// (each tuple using the same ordering as the variable list such that tuple element 0 is the value for the variable 0...)
-    pub fn from_tuples(
-        variables: Arc<[Variable]>,
-        iter: impl IntoIterator<Item = Result<Vec<Option<Term>>, QueryEvaluationError>> + 'a,
-    ) -> Self {
-        Self::new(
-            Arc::clone(&variables),
-            iter.into_iter()
-                .map(move |values| Ok((Arc::clone(&variables), values?).into())),
-        )
     }
 
     /// The variables used in the solutions.
@@ -130,8 +118,24 @@ impl<'a> QuerySolutionIter<'a> {
     }
 }
 
-impl Iterator for QuerySolutionIter<'_> {
-    type Item = Result<QuerySolution, QueryEvaluationError>;
+impl<'a> QuerySolutionIter<'a, QuerySolution> {
+    /// Construct a new iterator of solutions from an ordered list of solution variables and an iterator of solution tuples
+    /// (each tuple using the same ordering as the variable list such that tuple element 0 is the value for the variable 0...)
+    pub fn from_tuples<I>(variables: Arc<[Variable]>, iter: I) -> Self
+    where
+        I: IntoIterator<Item = Result<Vec<Option<Term>>, QueryEvaluationError>>,
+        I::IntoIter: 'a,
+    {
+        Self::new(
+            Arc::clone(&variables),
+            iter.into_iter()
+                .map(move |values| Ok((Arc::clone(&variables), values?).into())),
+        )
+    }
+}
+
+impl<T> Iterator for QuerySolutionIter<'_, T> {
+    type Item = Result<T, QueryEvaluationError>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -184,20 +188,24 @@ impl<'a> From<SliceSolutionsParser<'a>> for QuerySolutionIter<'a> {
 /// }
 /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
 /// ```
-pub struct QueryTripleIter<'a> {
-    iter: Box<dyn Iterator<Item = Result<Triple, QueryEvaluationError>> + 'a>,
+pub struct QueryTripleIter<'a, T = Triple> {
+    iter: Box<dyn Iterator<Item = Result<T, QueryEvaluationError>> + 'a>,
 }
 
-impl<'a> QueryTripleIter<'a> {
-    pub fn new(iter: impl Iterator<Item = Result<Triple, QueryEvaluationError>> + 'a) -> Self {
+impl<'a, T> QueryTripleIter<'a, T> {
+    pub fn new<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = Result<T, QueryEvaluationError>>,
+        I::IntoIter: 'a,
+    {
         Self {
-            iter: Box::new(iter),
+            iter: Box::new(iter.into_iter()),
         }
     }
 }
 
-impl Iterator for QueryTripleIter<'_> {
-    type Item = Result<Triple, QueryEvaluationError>;
+impl<T> Iterator for QueryTripleIter<'_, T> {
+    type Item = Result<T, QueryEvaluationError>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {

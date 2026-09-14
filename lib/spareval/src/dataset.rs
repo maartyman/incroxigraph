@@ -1,3 +1,5 @@
+use crate::Delta;
+use crate::eval::{IncrementalQueryNotifier, StreamingItem};
 #[cfg(feature = "sparql-12")]
 use oxrdf::BaseDirection;
 use oxrdf::{
@@ -18,6 +20,7 @@ use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::iter::empty;
 use std::mem::discriminant;
+use std::sync::Weak;
 
 /// A [RDF dataset](https://www.w3.org/TR/sparql11-query/#rdfDataset) that can be queried using SPARQL
 pub trait QueryableDataset<'a>: Sized + 'a {
@@ -150,6 +153,26 @@ pub trait QueryableDataset<'a>: Sized + 'a {
     }
 }
 
+/// A dataset that can expose quad-pattern matches as deltas.
+pub trait IncrementalQueryableDataset<'a>: QueryableDataset<'a> {
+    fn internal_quad_deltas_for_pattern(
+        &self,
+        subject: Option<&Self::InternalTerm>,
+        predicate: Option<&Self::InternalTerm>,
+        object: Option<&Self::InternalTerm>,
+        graph_name: Option<Option<&Self::InternalTerm>>,
+        notifier: Weak<IncrementalQueryNotifier>,
+    ) -> impl Iterator<
+        Item = Result<StreamingItem<Delta<InternalQuad<Self::InternalTerm>>>, Self::Error>,
+    > + use<'a, Self> {
+        drop(notifier);
+        self.internal_quads_for_pattern(subject, predicate, object, graph_name)
+            .map(|quad| quad.map(Delta::addition).map(StreamingItem::Item))
+    }
+}
+
+impl<'a> IncrementalQueryableDataset<'a> for &'a Dataset {}
+
 impl<'a> QueryableDataset<'a> for &'a Dataset {
     type InternalTerm = Term;
     type Error = Infallible;
@@ -267,6 +290,7 @@ impl<'a> QueryableDataset<'a> for &'a Dataset {
     }
 }
 
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct InternalQuad<T> {
     pub subject: T,
     pub predicate: T,

@@ -39,8 +39,18 @@ use std::marker::PhantomData;
 use std::mem::take;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, atomic};
+use std::sync::{Arc, Mutex, atomic};
+use std::task::Waker;
 use std::{fmt, io};
+
+#[path = "eval_incremental.rs"]
+mod incremental;
+pub(crate) use incremental::SimpleIncrementalEvaluator;
+pub use incremental::{
+    IncrementalDriverState, IncrementalQueryNotifier, IncrementalSelectDriver, QuerySolutionChange,
+    StreamingItem,
+};
+
 // TODO: make expression raise error when relevant (storage I/O)
 
 type InternalTupleEvaluator<'a, T> =
@@ -4142,6 +4152,7 @@ impl Timer {
 #[derive(Clone, Default)]
 pub struct CancellationToken {
     value: Arc<AtomicBool>,
+    wakers: Arc<Mutex<Vec<Waker>>>,
 }
 
 impl CancellationToken {
@@ -4149,12 +4160,16 @@ impl CancellationToken {
     pub fn new() -> Self {
         Self {
             value: Arc::new(AtomicBool::new(false)),
+            wakers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     #[inline]
     pub fn cancel(&self) {
         self.value.store(true, atomic::Ordering::Relaxed);
+        for waker in take(&mut *self.wakers.lock().unwrap()) {
+            waker.wake();
+        }
     }
 
     #[inline]
@@ -4168,5 +4183,19 @@ impl CancellationToken {
         } else {
             Ok(())
         }
+    }
+
+    fn register_waker(&self, waker: &Waker) {
+        let mut stored = self.wakers.lock().unwrap();
+        if !stored.iter().any(|old| old.will_wake(waker)) {
+            stored.push(waker.clone());
+        }
+    }
+
+    fn unregister_waker(&self, waker: &Waker) {
+        self.wakers
+            .lock()
+            .unwrap()
+            .retain(|old| !old.will_wake(waker));
     }
 }

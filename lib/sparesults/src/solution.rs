@@ -147,6 +147,112 @@ impl QuerySolution {
     }
 }
 
+/// A borrowed view of a query solution.
+///
+/// Unlike [`QuerySolution`], this type does not own the variables or values. It is useful when a
+/// query engine already retains a solution set and wants to expose a snapshot without cloning it.
+pub struct QuerySolutionRef<'a> {
+    variables: &'a [Variable],
+    values: &'a [Option<Term>],
+}
+
+impl<'a> QuerySolutionRef<'a> {
+    #[inline]
+    pub fn new(variables: &'a [Variable], values: &'a [Option<Term>]) -> Self {
+        Self { variables, values }
+    }
+
+    #[inline]
+    pub fn get(&self, index: impl QuerySolutionRefIndex) -> Option<&'a Term> {
+        self.values
+            .get(index.position(self.variables)?)
+            .and_then(Option::as_ref)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.values.iter().all(Option::is_none)
+    }
+
+    #[inline]
+    pub fn iter(&self) -> Iter<'a> {
+        Iter {
+            inner: self.variables.iter().zip(self.values),
+        }
+    }
+
+    #[inline]
+    pub fn values(&self) -> &'a [Option<Term>] {
+        self.values
+    }
+
+    #[inline]
+    pub fn variables(&self) -> &'a [Variable] {
+        self.variables
+    }
+}
+
+impl fmt::Debug for QuerySolutionRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl<'a> IntoIterator for &QuerySolutionRef<'a> {
+    type Item = (&'a Variable, &'a Term);
+    type IntoIter = Iter<'a>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// A utility trait to get values from a [`QuerySolutionRef`] by variable or tuple position.
+pub trait QuerySolutionRefIndex {
+    fn position(self, variables: &[Variable]) -> Option<usize>;
+}
+
+impl QuerySolutionRefIndex for usize {
+    #[inline]
+    fn position(self, _: &[Variable]) -> Option<usize> {
+        Some(self)
+    }
+}
+
+impl QuerySolutionRefIndex for &str {
+    #[inline]
+    fn position(self, variables: &[Variable]) -> Option<usize> {
+        variables.iter().position(|v| v.as_str() == self)
+    }
+}
+
+impl QuerySolutionRefIndex for VariableRef<'_> {
+    #[inline]
+    fn position(self, variables: &[Variable]) -> Option<usize> {
+        variables.iter().position(|v| v.as_ref() == self)
+    }
+}
+
+impl QuerySolutionRefIndex for Variable {
+    #[inline]
+    fn position(self, variables: &[Variable]) -> Option<usize> {
+        self.as_ref().position(variables)
+    }
+}
+
+impl QuerySolutionRefIndex for &Variable {
+    #[inline]
+    fn position(self, variables: &[Variable]) -> Option<usize> {
+        self.as_ref().position(variables)
+    }
+}
+
 impl<V: Into<Arc<[Variable]>>, S: Into<Vec<Option<Term>>>> From<(V, S)> for QuerySolution {
     #[inline]
     fn from((v, s): (V, S)) -> Self {

@@ -26,4 +26,4 @@ pub use crate::parser::{
 #[cfg(feature = "async-tokio")]
 pub use crate::serializer::TokioAsyncWriterSolutionsSerializer;
 pub use crate::serializer::{QueryResultsSerializer, WriterSolutionsSerializer};
-pub use crate::solution::QuerySolution;
+pub use crate::solution::{QuerySolution, QuerySolutionRef};
