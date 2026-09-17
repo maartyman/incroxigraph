@@ -10,6 +10,7 @@ use dashmap::{DashMap, DashSet};
 use oxstr::OxString;
 use rustc_hash::FxHasher;
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem::{take, transmute};
@@ -103,6 +104,10 @@ pub struct MemoryStorageReader<'a> {
 }
 
 impl<'a> MemoryStorageReader<'a> {
+    pub(super) fn latest_snapshot(&self) -> MemoryStorageReader<'static> {
+        self.storage.snapshot()
+    }
+
     pub fn len(&self) -> usize {
         self.storage
             .content
@@ -431,6 +436,24 @@ impl MemoryStorageTransaction<'_> {
             snapshot_id: self.transaction_id,
             _lifetime: PhantomData,
         }
+    }
+
+    pub(super) fn pending_quad_changes(&self) -> Vec<(EncodedQuad, bool)> {
+        let mut changes = HashMap::new();
+        for operation in &self.log {
+            let LogEntry::QuadNode(node) = operation else {
+                continue;
+            };
+            let range = node.range.lock().unwrap();
+            let was_present = range.contains(self.snapshot_id);
+            let is_present = range.contains(self.transaction_id);
+            if was_present == is_present {
+                changes.remove(&node.quad);
+            } else {
+                changes.insert(node.quad.clone(), is_present);
+            }
+        }
+        changes.into_iter().collect()
     }
 
     pub fn insert(&mut self, quad: Quad) {
@@ -816,6 +839,10 @@ pub struct MemoryStorageBulkLoader<'a> {
 }
 
 impl MemoryStorageBulkLoader<'_> {
+    pub(super) fn pending_quad_changes(&self) -> Vec<(EncodedQuad, bool)> {
+        self.transaction.pending_quad_changes()
+    }
+
     pub fn on_progress(mut self, callback: impl Fn(u64) + Send + Sync + 'static) -> Self {
         self.hooks.push(Box::new(callback));
         self

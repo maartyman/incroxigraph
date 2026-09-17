@@ -18,11 +18,14 @@ use crate::sparql::http::HttpServiceHandler;
 pub use crate::sparql::update::{BoundPreparedSparqlUpdate, PreparedSparqlUpdate};
 use crate::store::{Store, Transaction};
 pub use spareval::{
-    AggregateFunctionAccumulator, CancellationToken, DefaultServiceHandler,
-    QueryDatasetSpecification, QueryEvaluationError, QueryExplanation, QueryResults, QuerySolution,
-    QuerySolutionIter, QueryTripleIter, ServiceHandler,
+    AggregateFunctionAccumulator, CancellationToken, DefaultServiceHandler, Delta,
+    IncrementalDriverState, IncrementalSelectDeltasIter, IncrementalSelectDeltasState,
+    IncrementalSelectDriver, IncrementalSelectResultsIter, IncrementalSelectResultsState,
+    QueryDatasetSpecification, QueryEvaluationError, QueryExplanation, QueryResults,
+    QueryResultsDelta, QuerySolution, QuerySolutionDeltaIter, QuerySolutionIter,
+    QueryTripleDeltaIter, QueryTripleIter, ServiceHandler,
 };
-use spareval::{QueryEvaluator, QueryableDataset};
+use spareval::{IncrementalQueryableDataset, QueryEvaluator, QueryableDataset};
 use spargebra::SparqlParser;
 pub use spargebra::{Query, SparqlSyntaxError, Update};
 use std::collections::HashMap;
@@ -742,5 +745,61 @@ impl<'a, D: QueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
         }
         *prepared.dataset_mut() = self.dataset;
         prepared.explain(self.queryable_dataset)
+    }
+}
+
+impl<'a, D: IncrementalQueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
+    /// Evaluate the query incrementally and return state for complete result snapshots.
+    pub fn execute_incremental_results(
+        self,
+    ) -> Result<IncrementalSelectResultsState<'a, D>, QueryEvaluationError> {
+        let mut prepared = self.evaluator.prepare(&self.query);
+        for (variable, term) in self.substitutions {
+            prepared = prepared.substitute_variable(variable, term);
+        }
+        *prepared.dataset_mut() = self.dataset;
+        prepared.execute_incremental_results(self.queryable_dataset)
+    }
+
+    /// Evaluate the query incrementally and return state for result deltas.
+    pub fn execute_incremental_deltas(
+        self,
+    ) -> Result<IncrementalSelectDeltasState<'a, D>, QueryEvaluationError> {
+        let mut prepared = self.evaluator.prepare(&self.query);
+        for (variable, term) in self.substitutions {
+            prepared = prepared.substitute_variable(variable, term);
+        }
+        *prepared.dataset_mut() = self.dataset;
+        prepared.execute_incremental_deltas(self.queryable_dataset)
+    }
+
+    /// Evaluate the query incrementally and return a query explanation with result state.
+    pub fn explain_incremental_results(
+        self,
+    ) -> (
+        Result<IncrementalSelectResultsState<'a, D>, QueryEvaluationError>,
+        QueryExplanation,
+    ) {
+        let mut prepared = self.evaluator.prepare(&self.query);
+        for (variable, term) in self.substitutions {
+            prepared = prepared.substitute_variable(variable, term);
+        }
+        *prepared.dataset_mut() = self.dataset;
+        prepared.explain_incremental_results(self.queryable_dataset)
+    }
+
+    /// Evaluate the query incrementally and return a query explanation with delta state.
+    pub fn explain_incremental_deltas(
+        self,
+    ) -> (
+        Result<IncrementalSelectDeltasState<'a, D>, QueryEvaluationError>,
+        QueryExplanation,
+    ) {
+        let mut prepared = self.evaluator.prepare(&self.query);
+        for (variable, term) in self.substitutions {
+            prepared = prepared.substitute_variable(variable, term);
+        }
+        *prepared.dataset_mut() = self.dataset;
+        prepared.explain_incremental_deltas(self.queryable_dataset)
     }
 }

@@ -481,6 +481,7 @@ impl RocksDbStorage {
             sst_files: Vec::new(),
             done_counter: Arc::new(Mutex::new(0)),
             done_and_displayed_counter: 0,
+            pending_progress_events: Vec::new(),
             cancellation_token: CancellationToken::new(),
             atomic: true,
         }
@@ -1151,6 +1152,19 @@ impl StrLookup for RocksDbStorageReader<'_> {
     }
 }
 
+impl RocksDbStorageReader<'_> {
+    pub(super) fn latest_snapshot(&self) -> RocksDbStorageReader<'static> {
+        self.storage.snapshot()
+    }
+
+    pub(super) fn get_str_from_latest(
+        &self,
+        key: &StrHash,
+    ) -> Result<Option<OxString>, StorageError> {
+        self.latest_snapshot().get_str(key)
+    }
+}
+
 #[must_use]
 pub struct RocksDbStorageTransaction<'a> {
     buffer: Vec<u8>,
@@ -1590,6 +1604,7 @@ pub struct RocksDbStorageBulkLoader<'a> {
     sst_files: Vec<(ColumnFamily, PathBuf)>,
     done_counter: Arc<Mutex<u64>>,
     done_and_displayed_counter: u64,
+    pending_progress_events: Vec<u64>,
     cancellation_token: CancellationToken,
     atomic: bool,
 }
@@ -1672,9 +1687,7 @@ impl RocksDbStorageBulkLoader<'_> {
             .map_err(|_| io::Error::other("Mutex poisoned"))?;
         let display_step = DEFAULT_BULK_LOAD_BATCH_SIZE as u64;
         if new_counter / display_step > self.done_and_displayed_counter / display_step {
-            for hook in &self.hooks {
-                hook(new_counter);
-            }
+            self.pending_progress_events.push(new_counter);
         }
         self.done_and_displayed_counter = new_counter;
         Ok(())
@@ -1692,7 +1705,15 @@ impl RocksDbStorageBulkLoader<'_> {
         Ok(())
     }
 
-    pub fn commit(mut self) -> Result<(), StorageError> {
+    pub fn run_progress_callbacks(&mut self) {
+        for progress in self.pending_progress_events.drain(..) {
+            for hook in &self.hooks {
+                hook(progress);
+            }
+        }
+    }
+
+    pub fn commit(&mut self) -> Result<(), StorageError> {
         while let Some(thread) = self.threads.pop_front() {
             self.sst_files
                 .extend(map_thread_result(thread.join()).map_err(StorageError::Io)??);
