@@ -4,20 +4,23 @@ use crate::storage::numeric_encoder::{
     insert_term,
 };
 use crate::storage::{CorruptionError, DecodingQuadIterator, StorageError, StorageReader};
+use futures_core::Stream;
 use oxsdatatypes::Boolean;
 use oxstr::OxString;
 #[cfg(feature = "rdf-12")]
 use spareval::ExpressionTriple;
 use spareval::{
-    Delta, ExpressionTerm, IncrementalQueryNotifier, IncrementalQueryableDataset, InternalQuad,
-    InternalTriple, QueryableDataset, StreamingItem,
+    Delta, ExpressionTerm, IncrementalQueryableDataset, InternalQuad, InternalTriple,
+    QueryableDataset,
 };
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::vec_deque::IntoIter;
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
-use std::sync::{Arc, Weak};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 pub struct DatasetView<'a> {
     reader: Arc<StorageReader<'a>>,
@@ -222,16 +225,13 @@ impl<'a> IncrementalQueryableDataset<'a> for DatasetView<'a> {
         predicate: Option<&EncodedTerm>,
         object: Option<&EncodedTerm>,
         graph_name: Option<Option<&EncodedTerm>>,
-        notifier: Weak<IncrementalQueryNotifier>,
-    ) -> impl Iterator<Item = Result<StreamingItem<Delta<InternalQuad<EncodedTerm>>>, StorageError>>
-    + use<'a> {
+    ) -> impl Stream<Item = Result<Delta<InternalQuad<EncodedTerm>>, StorageError>> + use<'a> {
         Box::new(LiveQuadDeltaSource::new(
             Arc::clone(&self.reader),
             subject,
             predicate,
             object,
             graph_name,
-            notifier,
         ))
     }
 }
@@ -251,11 +251,10 @@ impl<'a> LiveQuadDeltaSource<'a> {
         predicate: Option<&EncodedTerm>,
         object: Option<&EncodedTerm>,
         graph_name: Option<Option<&EncodedTerm>>,
-        notifier: Weak<IncrementalQueryNotifier>,
     ) -> Self {
         let (subscription_id, reader) = if reader.can_refresh() {
-            let (subscription_id, fresh_reader) = reader
-                .subscribe_incremental_quads(subject, predicate, object, graph_name, notifier);
+            let (subscription_id, fresh_reader) =
+                reader.subscribe_incremental_quads(subject, predicate, object, graph_name);
             (
                 Some(subscription_id),
                 fresh_reader.map(Arc::new).unwrap_or(reader),
@@ -302,23 +301,31 @@ impl<'a> LiveQuadDeltaSource<'a> {
     }
 }
 
-impl Iterator for LiveQuadDeltaSource<'_> {
-    type Item = Result<StreamingItem<Delta<InternalQuad<EncodedTerm>>>, StorageError>;
+impl Stream for LiveQuadDeltaSource<'_> {
+    type Item = Result<Delta<InternalQuad<EncodedTerm>>, StorageError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if !self.snapshot_done {
             if let Some(quad) = self.snapshot_iter.next() {
-                return Some(
-                    quad.map(Self::map_quad)
-                        .map(Delta::addition)
-                        .map(StreamingItem::Item),
-                );
+                return Poll::Ready(Some(quad.map(Self::map_quad).map(Delta::addition)));
             }
             self.snapshot_done = true;
         }
-        self.next_live_change()
-            .map(|change| Ok(StreamingItem::Item(change.map(Self::map_quad))))
-            .or_else(|| self.subscription_id.map(|_| Ok(StreamingItem::Pending)))
+        if let Some(change) = self.next_live_change() {
+            Poll::Ready(Some(Ok(change.map(Self::map_quad))))
+        } else if let Some(subscription_id) = self.subscription_id {
+            let changes = self
+                .reader
+                .poll_incremental_quad_subscription(subscription_id, cx.waker());
+            self.live_buffer = changes.into_iter();
+            if let Some(change) = self.live_buffer.next() {
+                Poll::Ready(Some(Ok(change.map(Self::map_quad))))
+            } else {
+                Poll::Pending
+            }
+        } else {
+            Poll::Ready(None)
+        }
     }
 }
 

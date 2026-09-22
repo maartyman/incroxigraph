@@ -28,6 +28,7 @@ geosparql = ["spareval/geosparql"]
 
 [dependencies]
 dashmap.workspace = true
+futures-core.workspace = true
 oxiri.workspace = true
 oxrdf = { workspace = true, features = ["oxsdatatypes", "rdfc-10"] }
 oxrdfio.workspace = true

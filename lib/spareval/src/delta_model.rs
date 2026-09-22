@@ -2,11 +2,15 @@ use crate::{
     IncrementalDriverState, IncrementalQueryableDataset, IncrementalSelectDriver,
     QueryEvaluationError, QuerySolution, QuerySolutionIter, QueryTripleIter,
 };
+use futures_core::Stream;
+use futures_util::future::poll_fn;
 use oxrdf::{Triple, Variable};
 use rustc_hash::{FxHashMap, FxHasher};
 use sparesults::QuerySolutionRef;
 use std::hash::{Hash, Hasher};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 #[derive(Clone)]
 pub enum Delta<T> {
@@ -298,7 +302,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectResultsState<'a, D
             return Ok(changed);
         }
         loop {
-            match self.driver.poll_next()? {
+            match self.driver.poll_next_ready()? {
                 IncrementalDriverState::Item(change) => {
                     changed = true;
                     let (kind, solution) = change.into_parts();
@@ -317,35 +321,50 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectResultsState<'a, D
         Ok(changed)
     }
 
-    /// Awaits the next committed change to the underlying dataset.
-    ///
-    /// Lost-wakeup-safe: the caller captures the generation before draining, and this future
-    /// re-checks it before and after registering the task waker.
-    async fn wait_for_change(&self, baseline: u64) -> Result<(), QueryEvaluationError> {
-        self.driver.wait_for_change(baseline).await
-    }
-
     async fn next_results_snapshot(
         &mut self,
     ) -> Option<Result<IncrementalSelectResults<'_>, QueryEvaluationError>> {
+        let initial = !self.emitted_initial;
+        let changed = match poll_fn(|cx| self.poll_drain(cx, initial)).await {
+            Ok(changed) => changed,
+            Err(error) => return Some(Err(error)),
+        };
+        if initial {
+            self.emitted_initial = true;
+            Some(Ok(IncrementalSelectResults::new(self.current.iter())))
+        } else if changed {
+            Some(Ok(IncrementalSelectResults::new(self.current.iter())))
+        } else {
+            None
+        }
+    }
+
+    fn poll_drain(
+        &mut self,
+        cx: &mut Context<'_>,
+        return_on_pending: bool,
+    ) -> Poll<Result<bool, QueryEvaluationError>> {
+        let mut changed = false;
+        if self.done {
+            return Poll::Ready(Ok(false));
+        }
         loop {
-            let baseline = self.driver.change_generation();
-            let changed = match self.drain_ready() {
-                Ok(changed) => changed,
-                Err(error) => return Some(Err(error)),
-            };
-            if !self.emitted_initial {
-                self.emitted_initial = true;
-                return Some(Ok(IncrementalSelectResults::new(self.current.iter())));
-            }
-            if changed {
-                return Some(Ok(IncrementalSelectResults::new(self.current.iter())));
-            }
-            if self.done {
-                return None;
-            }
-            if let Err(error) = self.wait_for_change(baseline).await {
-                return Some(Err(error));
+            match Pin::new(&mut self.driver).poll_next(cx) {
+                Poll::Ready(Some(Ok(change))) => {
+                    changed = true;
+                    let (kind, solution) = change.into_parts();
+                    match kind {
+                        DeltaKind::Addition => self.current.insert(solution),
+                        DeltaKind::Deletion => self.current.remove_one(&solution),
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                Poll::Ready(None) => {
+                    self.done = true;
+                    return Poll::Ready(Ok(changed));
+                }
+                Poll::Pending if changed || return_on_pending => return Poll::Ready(Ok(changed)),
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -410,7 +429,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectDeltasState<'a, D>
             return Ok(batch);
         }
         loop {
-            match self.driver.poll_next()? {
+            match self.driver.poll_next_ready()? {
                 IncrementalDriverState::Item(change) => batch.push(change),
                 IncrementalDriverState::Pending => break,
                 IncrementalDriverState::Done => {
@@ -425,25 +444,37 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectDeltasState<'a, D>
     async fn next_deltas_batch(
         &mut self,
     ) -> Option<Result<QueryResultsDelta<'static>, QueryEvaluationError>> {
+        let batch = match poll_fn(|cx| self.poll_drain(cx)).await {
+            Ok(batch) => batch,
+            Err(error) => return Some(Err(error)),
+        };
+        if batch.is_empty() {
+            None
+        } else {
+            Some(Ok(QueryResultsDelta::Solutions(
+                QuerySolutionDeltaIter::new(Arc::clone(&self.variables), batch.into_iter().map(Ok)),
+            )))
+        }
+    }
+
+    fn poll_drain(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Vec<Delta<QuerySolution>>, QueryEvaluationError>> {
+        let mut batch = Vec::new();
+        if self.done {
+            return Poll::Ready(Ok(batch));
+        }
         loop {
-            let baseline = self.driver.change_generation();
-            let batch = match self.drain_ready() {
-                Ok(batch) => batch,
-                Err(error) => return Some(Err(error)),
-            };
-            if !batch.is_empty() {
-                return Some(Ok(QueryResultsDelta::Solutions(
-                    QuerySolutionDeltaIter::new(
-                        Arc::clone(&self.variables),
-                        batch.into_iter().map(Ok),
-                    ),
-                )));
-            }
-            if self.done {
-                return None;
-            }
-            if let Err(error) = self.driver.wait_for_change(baseline).await {
-                return Some(Err(error));
+            match Pin::new(&mut self.driver).poll_next(cx) {
+                Poll::Ready(Some(Ok(change))) => batch.push(change),
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                Poll::Ready(None) => {
+                    self.done = true;
+                    return Poll::Ready(Ok(batch));
+                }
+                Poll::Pending if !batch.is_empty() => return Poll::Ready(Ok(batch)),
+                Poll::Pending => return Poll::Pending,
             }
         }
     }

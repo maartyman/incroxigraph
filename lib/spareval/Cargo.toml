@@ -24,6 +24,8 @@ calendar-ext = [
 
 [dependencies]
 hex.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
 json-event-parser.workspace = true
 md-5.workspace = true
 oxiri.workspace = true

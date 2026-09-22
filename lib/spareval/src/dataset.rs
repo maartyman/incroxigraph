@@ -1,5 +1,6 @@
 use crate::Delta;
-use crate::eval::{IncrementalQueryNotifier, StreamingItem};
+use futures_core::Stream;
+use futures_util::stream;
 #[cfg(feature = "sparql-12")]
 use oxrdf::BaseDirection;
 use oxrdf::{
@@ -20,7 +21,6 @@ use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::iter::empty;
 use std::mem::discriminant;
-use std::sync::Weak;
 
 /// A [RDF dataset](https://www.w3.org/TR/sparql11-query/#rdfDataset) that can be queried using SPARQL
 pub trait QueryableDataset<'a>: Sized + 'a {
@@ -155,19 +155,19 @@ pub trait QueryableDataset<'a>: Sized + 'a {
 
 /// A dataset that can expose quad-pattern matches as deltas.
 pub trait IncrementalQueryableDataset<'a>: QueryableDataset<'a> {
+    /// Streams the initial matching snapshot followed by live matching deltas.
     fn internal_quad_deltas_for_pattern(
         &self,
         subject: Option<&Self::InternalTerm>,
         predicate: Option<&Self::InternalTerm>,
         object: Option<&Self::InternalTerm>,
         graph_name: Option<Option<&Self::InternalTerm>>,
-        notifier: Weak<IncrementalQueryNotifier>,
-    ) -> impl Iterator<
-        Item = Result<StreamingItem<Delta<InternalQuad<Self::InternalTerm>>>, Self::Error>,
-    > + use<'a, Self> {
-        drop(notifier);
-        self.internal_quads_for_pattern(subject, predicate, object, graph_name)
-            .map(|quad| quad.map(Delta::addition).map(StreamingItem::Item))
+    ) -> impl Stream<Item = Result<Delta<InternalQuad<Self::InternalTerm>>, Self::Error>> + use<'a, Self>
+    {
+        stream::iter(
+            self.internal_quads_for_pattern(subject, predicate, object, graph_name)
+                .map(|quad| quad.map(Delta::addition)),
+        )
     }
 }
 

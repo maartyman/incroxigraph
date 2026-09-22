@@ -1669,6 +1669,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "csv",
  "dashmap",
+ "futures-core",
  "getrandom 0.4.3",
  "js-sys",
  "libc",
@@ -2591,6 +2592,8 @@ dependencies = [
 name = "spareval"
 version = "0.3.0-dev"
 dependencies = [
+ "futures-core",
+ "futures-util",
  "hex",
  "json-event-parser",
  "md-5",

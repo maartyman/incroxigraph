@@ -15,12 +15,13 @@ use crate::storage::rocksdb::{
 };
 use oxstr::OxString;
 use rustc_hash::{FxBuildHasher, FxHashSet};
-use spareval::{Delta, IncrementalQueryNotifier};
+use spareval::Delta;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::take;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use std::path::Path;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
+use std::task::Waker;
 #[cfg(not(target_family = "wasm"))]
 use std::{io, thread};
 
@@ -97,7 +98,7 @@ impl IncrementalState {
 struct IncrementalSubscriber {
     pattern: IncrementalQuadPattern,
     changes: VecDeque<Delta<EncodedQuad>>,
-    notifier: Weak<IncrementalQueryNotifier>,
+    waker: Option<Waker>,
 }
 
 #[derive(Clone)]
@@ -392,36 +393,30 @@ impl Storage {
         }
     }
 
-    fn queue_committed_quad_changes(
-        &self,
-        changes: Vec<Delta<EncodedQuad>>,
-    ) -> HashMap<*const IncrementalQueryNotifier, Weak<IncrementalQueryNotifier>> {
+    fn queue_committed_quad_changes(&self, changes: Vec<Delta<EncodedQuad>>) -> Vec<Waker> {
         if changes.is_empty() {
-            return HashMap::new();
+            return Vec::new();
         }
         let mut state = self.incremental_state.lock().unwrap();
-        let mut notifiers = HashMap::new();
+        let mut wakers = Vec::new();
 
         for delta in changes {
             state.for_each_matching_subscriber(delta.value(), |subscriber| {
                 subscriber.changes.push_back(delta.clone());
-
-                notifiers
-                    .entry(subscriber.notifier.as_ptr())
-                    .or_insert_with(|| Weak::clone(&subscriber.notifier));
+                if let Some(waker) = subscriber.waker.take()
+                    && !wakers.iter().any(|old: &Waker| old.will_wake(&waker))
+                {
+                    wakers.push(waker);
+                }
             });
         }
-        notifiers
+        wakers
     }
 }
 
-fn notify_incremental_changes(
-    notifiers: HashMap<*const IncrementalQueryNotifier, Weak<IncrementalQueryNotifier>>,
-) {
-    for notifier in notifiers.into_values() {
-        if let Some(notifier) = notifier.upgrade() {
-            notifier.notify();
-        }
+fn wake_incremental_changes(wakers: Vec<Waker>) {
+    for waker in wakers {
+        waker.wake();
     }
 }
 
@@ -575,7 +570,6 @@ impl<'a> StorageReader<'a> {
         predicate: Option<&EncodedTerm>,
         object: Option<&EncodedTerm>,
         graph_name: Option<Option<&EncodedTerm>>,
-        notifier: Weak<IncrementalQueryNotifier>,
     ) -> (usize, Option<StorageReader<'static>>) {
         // Register before taking the fresh snapshot while commits are excluded. A commit is
         // therefore represented either in the snapshot or in the subscriber queue, never lost
@@ -596,7 +590,7 @@ impl<'a> StorageReader<'a> {
         let subscriber = Some(IncrementalSubscriber {
             pattern,
             changes: VecDeque::new(),
-            notifier,
+            waker: None,
         });
         if slot == state.subscribers.len() {
             state.subscribers.push(subscriber);
@@ -628,6 +622,29 @@ impl<'a> StorageReader<'a> {
             .get_mut(id)
             .and_then(Option::as_mut)
             .map_or_else(VecDeque::new, |subscriber| take(&mut subscriber.changes))
+    }
+
+    /// Atomically takes queued changes or installs the waker to be notified by a future commit.
+    pub fn poll_incremental_quad_subscription(
+        &self,
+        id: usize,
+        waker: &Waker,
+    ) -> VecDeque<Delta<EncodedQuad>> {
+        let mut state = self.incremental_state.lock().unwrap();
+        let Some(subscriber) = state.subscribers.get_mut(id).and_then(Option::as_mut) else {
+            return VecDeque::new();
+        };
+        if !subscriber.changes.is_empty() {
+            return take(&mut subscriber.changes);
+        }
+        if subscriber
+            .waker
+            .as_ref()
+            .is_none_or(|old| !old.will_wake(waker))
+        {
+            subscriber.waker = Some(waker.clone());
+        }
+        VecDeque::new()
     }
 
     pub fn unsubscribe_incremental_quads(&self, id: usize) {
@@ -973,7 +990,7 @@ impl IncrementalTransactionState {
         commit: impl FnOnce() -> Result<(), StorageError>,
     ) -> Result<(), StorageError> {
         let commit_lock = Arc::clone(&self.storage.incremental_commit_lock);
-        let notifiers = {
+        let wakers = {
             // Keep backend commit order and subscriber queue order identical.
             let _commit_guard = commit_lock
                 .lock()
@@ -998,7 +1015,7 @@ impl IncrementalTransactionState {
         };
         // Waking may run arbitrary executor code, so it must happen outside of
         // both the commit-order lock and the incremental-state lock.
-        notify_incremental_changes(notifiers);
+        wake_incremental_changes(wakers);
         Ok(())
     }
 }
@@ -1428,8 +1445,8 @@ impl StorageBulkLoader<'_> {
                     Ok(storage.queue_committed_quad_changes(changes))
                 })();
                 loader.run_progress_callbacks();
-                let notifiers = result?;
-                notify_incremental_changes(notifiers);
+                let wakers = result?;
+                wake_incremental_changes(wakers);
                 Ok(())
             }
             StorageBulkLoaderKind::Memory(loader) => {

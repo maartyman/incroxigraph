@@ -46,10 +46,7 @@ use std::{fmt, io};
 #[path = "eval_incremental.rs"]
 mod incremental;
 pub(crate) use incremental::SimpleIncrementalEvaluator;
-pub use incremental::{
-    IncrementalDriverState, IncrementalQueryNotifier, IncrementalSelectDriver, QuerySolutionChange,
-    StreamingItem,
-};
+pub use incremental::{IncrementalDriverState, IncrementalSelectDriver, QuerySolutionChange};
 
 // TODO: make expression raise error when relevant (storage I/O)
 

@@ -25,8 +25,7 @@ pub use crate::delta_model::{
 };
 pub use crate::error::QueryEvaluationError;
 pub use crate::eval::{
-    CancellationToken, IncrementalDriverState, IncrementalQueryNotifier, IncrementalSelectDriver,
-    QuerySolutionChange, StreamingItem,
+    CancellationToken, IncrementalDriverState, IncrementalSelectDriver, QuerySolutionChange,
 };
 use crate::eval::{EvalNodeWithStats, SimpleEvaluator, SimpleIncrementalEvaluator, Timer};
 use crate::expression::{
@@ -670,9 +669,9 @@ impl PreparedQuery<'_> {
     }
 
     /// Execute a SELECT query against the given [`IncrementalQueryableDataset`] and return the
-    /// low-level polling [`IncrementalSelectDriver`].
+    /// low-level asynchronous [`IncrementalSelectDriver`] stream.
     ///
-    /// This driver exposes the raw snapshot-plus-live poll loop for advanced use.
+    /// This driver exposes the raw snapshot-plus-live stream for advanced use.
     pub fn execute_incremental_driver<'b, D: IncrementalQueryableDataset<'b>>(
         self,
         dataset: D,
@@ -707,7 +706,7 @@ impl PreparedQuery<'_> {
         (driver.map(IncrementalSelectDeltasState::new), explanation)
     }
 
-    /// Execute a SELECT query incrementally using the low-level polling driver and return a
+    /// Execute a SELECT query incrementally using the low-level asynchronous driver and return a
     /// [`QueryExplanation`] with optional statistics.
     pub fn explain_incremental_driver<'b, D: IncrementalQueryableDataset<'b>>(
         self,

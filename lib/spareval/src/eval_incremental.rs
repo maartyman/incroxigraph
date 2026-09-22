@@ -11,6 +11,8 @@ use crate::{
     IncrementalQueryableDataset, InternalQuad, QueryDatasetSpecification, QueryEvaluationError,
     QuerySolution,
 };
+use futures_core::Stream;
+use futures_util::stream::{self, StreamExt};
 use oxiri::Iri;
 #[cfg(feature = "sparql-12")]
 use oxrdf::Triple;
@@ -23,31 +25,17 @@ use spargebra::term::GroundTerm;
 use spargebra::term::GroundTriple;
 use sparopt::algebra::{JoinAlgorithm, QueryExpression};
 use std::cell::Cell;
-use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::iter::{empty, once};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-/// Item returned by a streaming incremental iterator.
-///
-/// `Pending` means the iterator is live but has no item available right now.
-/// `None` from the standard `Iterator::next` means the iterator is permanently
-/// exhausted.
-pub enum StreamingItem<T> {
-    Item(T),
-    Pending,
-}
-
 type InternalTupleDeltaEvaluator<'a, T> =
-    Rc<dyn Fn(InternalTuple<T>) -> InternalTupleDeltasIterator<'a, T> + 'a>;
+    Rc<dyn Fn(InternalTuple<T>) -> InternalTupleDeltasStream<'a, T> + 'a>;
 
-type InternalTupleDeltasIterator<'a, T> = Box<
-    dyn Iterator<Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>> + 'a,
->;
+type InternalTupleDeltasStream<'a, T> =
+    Pin<Box<dyn Stream<Item = Result<Delta<InternalTuple<T>>, QueryEvaluationError>> + 'a>>;
 
 pub type QuerySolutionChange = Delta<QuerySolution>;
 
@@ -57,99 +45,6 @@ pub enum IncrementalDriverState<T> {
     Done,
 }
 
-/// Query-local notification state shared weakly with its live dataset subscriptions.
-pub struct IncrementalQueryNotifier {
-    generation: AtomicU64,
-    waker: Mutex<Option<Waker>>,
-}
-
-impl IncrementalQueryNotifier {
-    fn new() -> Self {
-        Self {
-            generation: AtomicU64::new(0),
-            waker: Mutex::new(None),
-        }
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-
-    pub fn register_waker(&self, waker: &Waker) {
-        let mut stored = self.waker.lock().unwrap();
-        if stored.as_ref().is_none_or(|old| !old.will_wake(waker)) {
-            *stored = Some(waker.clone());
-        }
-    }
-
-    pub fn clear_waker(&self) {
-        *self.waker.lock().unwrap() = None;
-    }
-
-    pub fn notify(&self) {
-        self.generation.fetch_add(1, Ordering::Release);
-        let waker = self.waker.lock().unwrap().take();
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-
-    pub(crate) fn changed_since<'n, 'c>(
-        &'n self,
-        baseline: u64,
-        cancellation_token: &'c CancellationToken,
-    ) -> NotifierChangeFuture<'n, 'c> {
-        NotifierChangeFuture {
-            notifier: self,
-            baseline,
-            cancellation_token,
-            cancellation_waker: None,
-        }
-    }
-}
-
-/// Future that resolves when a query notifier observes a change after `baseline`.
-pub(crate) struct NotifierChangeFuture<'n, 'c> {
-    notifier: &'n IncrementalQueryNotifier,
-    baseline: u64,
-    cancellation_token: &'c CancellationToken,
-    cancellation_waker: Option<Waker>,
-}
-
-impl Future for NotifierChangeFuture<'_, '_> {
-    type Output = Result<(), QueryEvaluationError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), QueryEvaluationError>> {
-        let this = self.get_mut();
-        this.cancellation_token.ensure_alive()?;
-        if this.notifier.generation() != this.baseline {
-            return Poll::Ready(Ok(()));
-        }
-        this.notifier.register_waker(cx.waker());
-        if let Some(old_waker) = &this.cancellation_waker
-            && !old_waker.will_wake(cx.waker())
-        {
-            this.cancellation_token.unregister_waker(old_waker);
-        }
-        this.cancellation_token.register_waker(cx.waker());
-        this.cancellation_waker = Some(cx.waker().clone());
-        this.cancellation_token.ensure_alive()?;
-        if this.notifier.generation() != this.baseline {
-            return Poll::Ready(Ok(()));
-        }
-        Poll::Pending
-    }
-}
-
-impl Drop for NotifierChangeFuture<'_, '_> {
-    fn drop(&mut self) {
-        self.notifier.clear_waker();
-        if let Some(waker) = &self.cancellation_waker {
-            self.cancellation_token.unregister_waker(waker);
-        }
-    }
-}
-
 impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
     fn underlying_internal_quad_deltas_for_pattern(
         &self,
@@ -157,13 +52,11 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
         predicate: Option<&D::InternalTerm>,
         object: Option<&D::InternalTerm>,
         graph_name: Option<Option<&D::InternalTerm>>,
-        notifier: Weak<IncrementalQueryNotifier>,
-    ) -> impl Iterator<
-        Item = Result<StreamingItem<Delta<InternalQuad<D::InternalTerm>>>, QueryEvaluationError>,
-    > + use<'a, D> {
+    ) -> impl Stream<Item = Result<Delta<InternalQuad<D::InternalTerm>>, QueryEvaluationError>>
+    + use<'a, D> {
         let cancellation_token = self.cancellation_token.clone();
         self.dataset
-            .internal_quad_deltas_for_pattern(subject, predicate, object, graph_name, notifier)
+            .internal_quad_deltas_for_pattern(subject, predicate, object, graph_name)
             .map(move |r| {
                 cancellation_token.ensure_alive()?;
                 r.map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))
@@ -176,15 +69,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
         predicate: Option<&D::InternalTerm>,
         object: Option<&D::InternalTerm>,
         graph_name: Option<Option<&D::InternalTerm>>,
-        notifier: Weak<IncrementalQueryNotifier>,
-    ) -> Box<
-        dyn Iterator<
-                Item = Result<
-                    StreamingItem<Delta<InternalQuad<D::InternalTerm>>>,
-                    QueryEvaluationError,
-                >,
-            > + 'a,
-    > {
+    ) -> InternalQuadDeltaStream<'a, D::InternalTerm> {
         if let Some(graph_name) = graph_name {
             if let Some(graph_name) = graph_name {
                 if self
@@ -193,168 +78,150 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
                     .as_ref()
                     .is_none_or(|d| d.contains(graph_name))
                 {
-                    Box::new(self.underlying_internal_quad_deltas_for_pattern(
+                    Box::pin(self.underlying_internal_quad_deltas_for_pattern(
                         subject,
                         predicate,
                         object,
                         Some(Some(graph_name)),
-                        notifier,
                     ))
                 } else {
-                    Box::new(empty())
+                    Box::pin(stream::empty())
                 }
             } else if let Some(default_graph_graphs) = &self.specification.default {
                 if default_graph_graphs.len() == 1 {
-                    Box::new(
+                    Box::pin(
                         self.underlying_internal_quad_deltas_for_pattern(
                             subject,
                             predicate,
                             object,
                             Some(default_graph_graphs[0].as_ref()),
-                            notifier,
                         )
                         .map(|quad| {
-                            let quad = quad?;
-                            Ok(match quad {
-                                StreamingItem::Item(mut quad) => {
-                                    quad.value_mut().graph_name = None;
-                                    StreamingItem::Item(quad)
-                                }
-                                StreamingItem::Pending => StreamingItem::Pending,
-                            })
+                            let mut quad = quad?;
+                            quad.value_mut().graph_name = None;
+                            Ok(quad)
                         }),
                     )
                 } else {
                     let iters = default_graph_graphs
                         .iter()
                         .map(
-                            |graph_name| -> InternalQuadDeltaIterator<'a, D::InternalTerm> {
-                                Box::new(self.underlying_internal_quad_deltas_for_pattern(
+                            |graph_name| -> InternalQuadDeltaStream<'a, D::InternalTerm> {
+                                Box::pin(self.underlying_internal_quad_deltas_for_pattern(
                                     subject,
                                     predicate,
                                     object,
                                     Some(graph_name.as_ref()),
-                                    Weak::clone(&notifier),
                                 ))
                             },
                         )
                         .collect::<Vec<_>>();
-                    Box::new(DeduplicatingDefaultGraphIterator::new(
-                        RoundRobinStreamingIterator::new(iters).map(|quad| {
-                            let quad = quad?;
-                            Ok(match quad {
-                                StreamingItem::Item(mut quad) => {
-                                    quad.value_mut().graph_name = None;
-                                    StreamingItem::Item(quad)
-                                }
-                                StreamingItem::Pending => StreamingItem::Pending,
-                            })
+                    Box::pin(DeduplicatingDefaultGraphStream::new(Box::pin(
+                        RoundRobinStream::new(iters).map(|quad| {
+                            let mut quad = quad?;
+                            quad.value_mut().graph_name = None;
+                            Ok(quad)
                         }),
-                    ))
+                    )))
                 }
             } else {
-                Box::new(DeduplicatingDefaultGraphIterator::new(
+                Box::pin(DeduplicatingDefaultGraphStream::new(Box::pin(
                     self.underlying_internal_quad_deltas_for_pattern(
-                        subject, predicate, object, None, notifier,
+                        subject, predicate, object, None,
                     )
                     .map(|quad| {
-                        let quad = quad?;
-                        Ok(match quad {
-                            StreamingItem::Item(mut quad) => {
-                                quad.value_mut().graph_name = None;
-                                StreamingItem::Item(quad)
-                            }
-                            StreamingItem::Pending => StreamingItem::Pending,
-                        })
+                        let mut quad = quad?;
+                        quad.value_mut().graph_name = None;
+                        Ok(quad)
                     }),
-                ))
+                )))
             }
         } else if let Some(named_graphs) = &self.specification.named {
             let iters = named_graphs
                 .iter()
                 .map(
-                    |graph_name| -> InternalQuadDeltaIterator<'a, D::InternalTerm> {
-                        Box::new(self.underlying_internal_quad_deltas_for_pattern(
+                    |graph_name| -> InternalQuadDeltaStream<'a, D::InternalTerm> {
+                        Box::pin(self.underlying_internal_quad_deltas_for_pattern(
                             subject,
                             predicate,
                             object,
                             Some(Some(graph_name)),
-                            Weak::clone(&notifier),
                         ))
                     },
                 )
                 .collect::<Vec<_>>();
-            Box::new(RoundRobinStreamingIterator::new(iters))
+            Box::pin(RoundRobinStream::new(iters))
         } else {
-            Box::new(
-                self.underlying_internal_quad_deltas_for_pattern(
-                    subject, predicate, object, None, notifier,
-                )
-                .filter(|q| {
-                    !q.as_ref().is_ok_and(|q| {
-                        matches!(
-                            q,
-                            StreamingItem::Item(quad_delta)
-                                if quad_delta.value().graph_name.is_none()
+            Box::pin(
+                self.underlying_internal_quad_deltas_for_pattern(subject, predicate, object, None)
+                    .filter(|q| {
+                        std::future::ready(
+                            !q.as_ref()
+                                .is_ok_and(|quad_delta| quad_delta.value().graph_name.is_none()),
                         )
-                    })
-                }),
+                    }),
             )
         }
     }
 }
 
-type InternalQuadDeltaIterator<'a, T> = Box<
-    dyn Iterator<Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>> + 'a,
->;
+type InternalQuadDeltaStream<'a, T> =
+    Pin<Box<dyn Stream<Item = Result<Delta<InternalQuad<T>>, QueryEvaluationError>> + 'a>>;
 
 /// Polls each live source once per round, so a pending source cannot starve the others.
-struct RoundRobinStreamingIterator<'a, T> {
-    iterators: Vec<Option<InternalQuadDeltaIterator<'a, T>>>,
+struct RoundRobinStream<'a, T> {
+    streams: Vec<Option<InternalQuadDeltaStream<'a, T>>>,
     next: usize,
 }
 
-impl<'a, T> RoundRobinStreamingIterator<'a, T> {
-    fn new(iterators: Vec<InternalQuadDeltaIterator<'a, T>>) -> Self {
+impl<'a, T> RoundRobinStream<'a, T> {
+    fn new(streams: Vec<InternalQuadDeltaStream<'a, T>>) -> Self {
         Self {
-            iterators: iterators.into_iter().map(Some).collect(),
+            streams: streams.into_iter().map(Some).collect(),
             next: 0,
         }
     }
 }
 
-impl<T> Iterator for RoundRobinStreamingIterator<'_, T> {
-    type Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>;
+impl<T> Stream for RoundRobinStream<'_, T> {
+    type Item = Result<Delta<InternalQuad<T>>, QueryEvaluationError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.iterators.is_empty() {
-            return None;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.streams.is_empty() {
+            return Poll::Ready(None);
         }
         let mut live = false;
-        for _ in 0..self.iterators.len() {
-            let index = self.next;
-            self.next = (self.next + 1) % self.iterators.len();
-            let Some(iterator) = &mut self.iterators[index] else {
+        for _ in 0..this.streams.len() {
+            let index = this.next;
+            this.next = (this.next + 1) % this.streams.len();
+            let Some(stream) = &mut this.streams[index] else {
                 continue;
             };
-            match iterator.next() {
-                Some(Ok(StreamingItem::Pending)) => live = true,
-                Some(item) => return Some(item),
-                None => self.iterators[index] = None,
+            match stream.as_mut().poll_next(cx) {
+                Poll::Pending => live = true,
+                Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
+                Poll::Ready(None) => this.streams[index] = None,
             }
         }
-        live.then_some(Ok(StreamingItem::Pending))
+        if live {
+            Poll::Pending
+        } else {
+            Poll::Ready(None)
+        }
     }
 }
 
 /// Turns a union of RDF graphs into an RDF graph by retaining one copy of each triple.
-struct DeduplicatingDefaultGraphIterator<I, T> {
-    inner: I,
+struct DeduplicatingDefaultGraphStream<'a, T> {
+    inner: InternalQuadDeltaStream<'a, T>,
     counts: FxHashMap<InternalQuad<T>, usize>,
 }
 
-impl<I, T> DeduplicatingDefaultGraphIterator<I, T> {
-    fn new(inner: I) -> Self {
+impl<T> Unpin for DeduplicatingDefaultGraphStream<'_, T> {}
+
+impl<'a, T> DeduplicatingDefaultGraphStream<'a, T> {
+    fn new(inner: InternalQuadDeltaStream<'a, T>) -> Self {
         Self {
             inner,
             counts: FxHashMap::default(),
@@ -362,36 +229,33 @@ impl<I, T> DeduplicatingDefaultGraphIterator<I, T> {
     }
 }
 
-impl<I, T> Iterator for DeduplicatingDefaultGraphIterator<I, T>
-where
-    I: Iterator<Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>>,
-    T: Clone + Eq + Hash,
-{
-    type Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>;
+impl<T: Clone + Eq + Hash> Stream for DeduplicatingDefaultGraphStream<'_, T> {
+    type Item = Result<Delta<InternalQuad<T>>, QueryEvaluationError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         loop {
-            let item = self.inner.next()?;
-            let delta = match item {
-                Ok(StreamingItem::Pending) => return Some(Ok(StreamingItem::Pending)),
-                Err(error) => return Some(Err(error)),
-                Ok(StreamingItem::Item(delta)) => delta,
+            let delta = match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                Poll::Ready(Some(Ok(delta))) => delta,
             };
             match delta {
                 Delta::Addition(quad) => {
-                    let count = self.counts.entry(quad.clone()).or_default();
+                    let count = this.counts.entry(quad.clone()).or_default();
                     *count += 1;
                     if *count == 1 {
-                        return Some(Ok(StreamingItem::Item(Delta::Addition(quad))));
+                        return Poll::Ready(Some(Ok(Delta::Addition(quad))));
                     }
                 }
-                Delta::Deletion(quad) => match self.counts.get_mut(&quad) {
+                Delta::Deletion(quad) => match this.counts.get_mut(&quad) {
                     Some(count) if *count > 1 => *count -= 1,
                     Some(_) => {
-                        self.counts.remove(&quad);
-                        return Some(Ok(StreamingItem::Item(Delta::Deletion(quad))));
+                        this.counts.remove(&quad);
+                        return Poll::Ready(Some(Ok(Delta::Deletion(quad))));
                     }
-                    None => return Some(Err(non_existing_tuple_deleted())),
+                    None => return Poll::Ready(Some(Err(non_existing_tuple_deleted()))),
                 },
             }
         }
@@ -400,28 +264,18 @@ where
 
 struct IncrementalDriverCore<'a, D: IncrementalQueryableDataset<'a>> {
     dataset: EvalDataset<'a, D>,
-    notifier: Arc<IncrementalQueryNotifier>,
 }
 
-impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalDriverCore<'a, D> {
-    fn change_generation(&self) -> u64 {
-        self.notifier.generation()
-    }
-
-    fn register_waker(&self, waker: &Waker) {
-        self.notifier.register_waker(waker);
-    }
-}
-
+/// Asynchronous stream of solution changes produced by an incremental SELECT query.
 pub struct IncrementalSelectDriver<'a, D: IncrementalQueryableDataset<'a>> {
     core: IncrementalDriverCore<'a, D>,
     variables: Arc<[Variable]>,
-    iter: InternalTupleDeltasIterator<'a, D::InternalTerm>,
+    stream: InternalTupleDeltasStream<'a, D::InternalTerm>,
+    cancellation_waker: Option<Waker>,
 }
 
 pub struct SimpleIncrementalEvaluator<'a, D: IncrementalQueryableDataset<'a>> {
     dataset: EvalDataset<'a, D>,
-    notifier: Arc<IncrementalQueryNotifier>,
     base_iri: Option<Iri<OxString>>,
     now: DateTime,
     service_handler: Rc<ServiceHandlerRegistry>,
@@ -443,7 +297,6 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
     ) -> Result<Self, QueryEvaluationError> {
         Ok(Self {
             dataset: EvalDataset::new(dataset, dataset_spec, cancellation_token)?,
-            notifier: Arc::new(IncrementalQueryNotifier::new()),
             base_iri,
             now: DateTime::now(),
             service_handler,
@@ -461,10 +314,8 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
         Result<IncrementalSelectDriver<'a, D>, QueryEvaluationError>,
         Rc<EvalNodeWithStats>,
     ) {
-        let notifier = Arc::new(IncrementalQueryNotifier::new());
         let evaluator = Self {
             dataset: self.dataset.clone(),
-            notifier: Arc::clone(&notifier),
             base_iri: self.base_iri.clone(),
             now: self.now,
             service_handler: Rc::clone(&self.service_handler),
@@ -486,10 +337,10 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
             Ok(IncrementalSelectDriver {
                 core: IncrementalDriverCore {
                     dataset: evaluator.dataset.clone(),
-                    notifier,
                 },
                 variables: Arc::from(variables),
-                iter: eval(from),
+                stream: eval(from),
+                cancellation_waker: None,
             }),
             stats,
         )
@@ -528,7 +379,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         .get()
                         .and_then(|d| d.checked_add(duration?)),
                 );
-                Box::new(StatsDeltaIterator {
+                Box::pin(StatsDeltaStream {
                     inner,
                     stats: Rc::clone(&stats),
                 })
@@ -577,14 +428,13 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                     })
                     .collect::<Result<Vec<_>, QueryEvaluationError>>()?;
                 Rc::new(move |from| {
-                    Box::new(
+                    Box::pin(stream::iter(
                         encoded_tuples
                             .iter()
                             .filter_map(move |t| from.combine_with(t))
-                            .map(|tuple| Ok(StreamingItem::Item(Delta::addition(tuple))))
-                            .collect::<Vec<_>>()
-                            .into_iter(),
-                    )
+                            .map(|tuple| Ok(Delta::addition(tuple)))
+                            .collect::<Vec<_>>(),
+                    ))
                 })
             }
             QueryExpression::QuadPattern {
@@ -612,7 +462,6 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                     None
                 };
                 let dataset = self.dataset.clone();
-                let notifier = Arc::downgrade(&self.notifier);
                 Rc::new(move |from| {
                     let input_subject = match subject_selector.get_pattern_value(
                         &from,
@@ -620,7 +469,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         &dataset,
                     ) {
                         Ok(value) => value,
-                        Err(e) => return Box::new(once(Err(e))),
+                        Err(e) => return Box::pin(stream::iter([Err(e)])),
                     };
                     let input_predicate = match predicate_selector.get_pattern_value(
                         &from,
@@ -628,7 +477,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         &dataset,
                     ) {
                         Ok(value) => value,
-                        Err(e) => return Box::new(once(Err(e))),
+                        Err(e) => return Box::pin(stream::iter([Err(e)])),
                     };
                     let input_object = match object_selector.get_pattern_value(
                         &from,
@@ -636,7 +485,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         &dataset,
                     ) {
                         Ok(value) => value,
-                        Err(e) => return Box::new(once(Err(e))),
+                        Err(e) => return Box::pin(stream::iter([Err(e)])),
                     };
                     let input_graph_name = if let Some(graph_name_selector) = &graph_name_selector {
                         match graph_name_selector.get_pattern_value(
@@ -645,7 +494,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                             &dataset,
                         ) {
                             Ok(value) => value,
-                            Err(e) => return Box::new(once(Err(e))),
+                            Err(e) => return Box::pin(stream::iter([Err(e)])),
                         }
                         .map(Some)
                     } else {
@@ -656,7 +505,6 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         input_predicate.as_ref(),
                         input_object.as_ref(),
                         input_graph_name.as_ref().map(|g| g.as_ref()),
-                        Weak::clone(&notifier),
                     );
                     let subject_selector = subject_selector.clone();
                     let predicate_selector = predicate_selector.clone();
@@ -664,57 +512,55 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                     let graph_name_selector = graph_name_selector.clone();
                     #[cfg(feature = "sparql-12")]
                     let dataset = dataset.clone();
-                    Box::new(
-                        iter.map(move |quad| match quad? {
-                            StreamingItem::Pending => Ok(Some(StreamingItem::Pending)),
-                            StreamingItem::Item(quad) => {
-                                let (kind, quad) = quad.into_parts();
-                                let mut new_tuple = from.clone();
-                                if !put_pattern_value::<D>(
-                                    &subject_selector,
-                                    quad.subject,
-                                    &mut new_tuple,
-                                    #[cfg(feature = "sparql-12")]
-                                    &dataset,
-                                )? {
-                                    return Ok(None);
-                                }
-                                if !put_pattern_value::<D>(
-                                    &predicate_selector,
-                                    quad.predicate,
-                                    &mut new_tuple,
-                                    #[cfg(feature = "sparql-12")]
-                                    &dataset,
-                                )? {
-                                    return Ok(None);
-                                }
-                                if !put_pattern_value::<D>(
-                                    &object_selector,
-                                    quad.object,
-                                    &mut new_tuple,
-                                    #[cfg(feature = "sparql-12")]
-                                    &dataset,
-                                )? {
-                                    return Ok(None);
-                                }
-                                if let Some(graph_name_selector) = &graph_name_selector {
-                                    let Some(quad_graph_name) = quad.graph_name else {
-                                        return Err(QueryEvaluationError::UnexpectedDefaultGraph);
-                                    };
-                                    if !put_pattern_value::<D>(
-                                        graph_name_selector,
-                                        quad_graph_name,
-                                        &mut new_tuple,
-                                        #[cfg(feature = "sparql-12")]
-                                        &dataset,
-                                    )? {
-                                        return Ok(None);
-                                    }
-                                }
-                                Ok(Some(StreamingItem::Item(Delta::with_kind(kind, new_tuple))))
+                    Box::pin(
+                        iter.map(move |quad| {
+                            let quad = quad?;
+                            let (kind, quad) = quad.into_parts();
+                            let mut new_tuple = from.clone();
+                            if !put_pattern_value::<D>(
+                                &subject_selector,
+                                quad.subject,
+                                &mut new_tuple,
+                                #[cfg(feature = "sparql-12")]
+                                &dataset,
+                            )? {
+                                return Ok(None);
                             }
+                            if !put_pattern_value::<D>(
+                                &predicate_selector,
+                                quad.predicate,
+                                &mut new_tuple,
+                                #[cfg(feature = "sparql-12")]
+                                &dataset,
+                            )? {
+                                return Ok(None);
+                            }
+                            if !put_pattern_value::<D>(
+                                &object_selector,
+                                quad.object,
+                                &mut new_tuple,
+                                #[cfg(feature = "sparql-12")]
+                                &dataset,
+                            )? {
+                                return Ok(None);
+                            }
+                            if let Some(graph_name_selector) = &graph_name_selector {
+                                let Some(quad_graph_name) = quad.graph_name else {
+                                    return Err(QueryEvaluationError::UnexpectedDefaultGraph);
+                                };
+                                if !put_pattern_value::<D>(
+                                    graph_name_selector,
+                                    quad_graph_name,
+                                    &mut new_tuple,
+                                    #[cfg(feature = "sparql-12")]
+                                    &dataset,
+                                )? {
+                                    return Ok(None);
+                                }
+                            }
+                            Ok(Some(Delta::with_kind(kind, new_tuple)))
                         })
-                        .filter_map(Result::transpose),
+                        .filter_map(|result| std::future::ready(result.transpose())),
                     )
                 })
             }
@@ -739,7 +585,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                     JoinAlgorithm::HashBuildLeftProbeRight { keys } => {
                         if keys.is_empty() {
                             Rc::new(move |from| {
-                                Box::new(SymmetricNestedLoopJoinIterator {
+                                Box::pin(SymmetricNestedLoopJoinStream {
                                     left_iter: left(from.clone()),
                                     right_iter: right(from),
                                     left_values: Vec::new(),
@@ -758,11 +604,9 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                             Rc::new(move |from| {
                                 let left_iter = left(from.clone());
                                 let right_iter = right(from);
-                                let mut left_values = InternalTupleSet::new(keys.clone());
-                                let mut right_values = InternalTupleSet::new(keys.clone());
-                                left_values.reserve(left_iter.size_hint().0);
-                                right_values.reserve(right_iter.size_hint().0);
-                                Box::new(SymmetricHashJoinIterator {
+                                let left_values = InternalTupleSet::new(keys.clone());
+                                let right_values = InternalTupleSet::new(keys.clone());
+                                Box::pin(SymmetricHashJoinStream {
                                     left_iter,
                                     right_iter,
                                     left_values,
@@ -831,9 +675,9 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         }
                     }
                     input_tuple.graph_name.clone_from(&from.graph_name);
-                    Box::new(child(input_tuple).filter_map(move |change| {
-                        match change {
-                            Ok(StreamingItem::Item(delta)) => {
+                    Box::pin(child(input_tuple).filter_map(move |change| {
+                        std::future::ready((|| match change {
+                            Ok(delta) => {
                                 let (kind, tuple) = delta.into_parts();
                                 let mut output_tuple = from.clone();
                                 for (input_key, output_key) in &*mapping {
@@ -848,14 +692,10 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                                         }
                                     }
                                 }
-                                Some(Ok(StreamingItem::Item(Delta::with_kind(
-                                    kind,
-                                    output_tuple,
-                                ))))
+                                Some(Ok(Delta::with_kind(kind, output_tuple)))
                             }
-                            Ok(StreamingItem::Pending) => Some(Ok(StreamingItem::Pending)),
                             Err(error) => Some(Err(error)),
-                        }
+                        })())
                     }))
                 })
             }
@@ -886,7 +726,6 @@ impl<'a, D: IncrementalQueryableDataset<'a>> Clone for SimpleIncrementalEvaluato
     fn clone(&self) -> Self {
         Self {
             dataset: self.dataset.clone(),
-            notifier: Arc::clone(&self.notifier),
             base_iri: self.base_iri.clone(),
             now: self.now,
             service_handler: Rc::clone(&self.service_handler),
@@ -903,42 +742,16 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectDriver<'a, D> {
         Arc::clone(&self.variables)
     }
 
-    /// A monotonically increasing counter of changes observed by this query.
-    pub fn change_generation(&self) -> u64 {
-        self.core.change_generation()
-    }
-
-    /// Registers `waker` to be notified when this query observes a dataset change.
-    pub fn register_waker(&self, waker: &Waker) {
-        self.core.register_waker(waker);
-    }
-
-    pub(crate) fn wait_for_change(&self, baseline: u64) -> NotifierChangeFuture<'_, '_> {
-        self.core
-            .notifier
-            .changed_since(baseline, &self.core.dataset.cancellation_token)
-    }
-
-    pub fn poll_next(
+    pub(crate) fn poll_next_ready(
         &mut self,
     ) -> Result<IncrementalDriverState<QuerySolutionChange>, QueryEvaluationError> {
-        match self.iter.next() {
-            Some(Ok(StreamingItem::Item(delta))) => {
-                let (kind, tuple) = delta.into_parts();
-                let mut result = vec![None; self.variables.len()];
-                for (index, value) in tuple.iter().enumerate() {
-                    if let Some(term) = value {
-                        result[index] = Some(self.core.dataset.externalize_term(term)?);
-                    }
-                }
-                Ok(IncrementalDriverState::Item(Delta::with_kind(
-                    kind,
-                    (Arc::clone(&self.variables), result).into(),
-                )))
-            }
-            Some(Ok(StreamingItem::Pending)) => Ok(IncrementalDriverState::Pending),
-            Some(Err(error)) => Err(error),
-            None => Ok(IncrementalDriverState::Done),
+        let waker = futures_util::task::noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        match Pin::new(self).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(delta))) => Ok(IncrementalDriverState::Item(delta)),
+            Poll::Ready(Some(Err(error))) => Err(error),
+            Poll::Ready(None) => Ok(IncrementalDriverState::Done),
+            Poll::Pending => Ok(IncrementalDriverState::Pending),
         }
     }
 
@@ -951,7 +764,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectDriver<'a, D> {
             if limit.is_some_and(|limit| results.len() >= limit) {
                 return Ok(IncrementalDriverState::Item(results));
             }
-            match self.poll_next()? {
+            match self.poll_next_ready()? {
                 IncrementalDriverState::Item(item) => results.push(item),
                 IncrementalDriverState::Pending if results.is_empty() => {
                     return Ok(IncrementalDriverState::Pending);
@@ -967,55 +780,125 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectDriver<'a, D> {
     }
 }
 
-struct SymmetricHashJoinIterator<'a, T> {
-    left_iter: InternalTupleDeltasIterator<'a, T>,
-    right_iter: InternalTupleDeltasIterator<'a, T>,
+impl<'a, D: IncrementalQueryableDataset<'a>> Unpin for IncrementalSelectDriver<'a, D> {}
+
+impl<'a, D: IncrementalQueryableDataset<'a>> Drop for IncrementalSelectDriver<'a, D> {
+    fn drop(&mut self) {
+        if let Some(waker) = &self.cancellation_waker {
+            self.core.dataset.cancellation_token.unregister_waker(waker);
+        }
+    }
+}
+
+impl<'a, D: IncrementalQueryableDataset<'a>> Stream for IncrementalSelectDriver<'a, D> {
+    type Item = Result<QuerySolutionChange, QueryEvaluationError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Err(error) = this.core.dataset.cancellation_token.ensure_alive() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        let result = match this.stream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(delta))) => {
+                let (kind, tuple) = delta.into_parts();
+                let mut result = vec![None; this.variables.len()];
+                for (index, value) in tuple.iter().enumerate() {
+                    if let Some(term) = value {
+                        let term = match this.core.dataset.externalize_term(term) {
+                            Ok(term) => term,
+                            Err(error) => return Poll::Ready(Some(Err(error))),
+                        };
+                        result[index] = Some(term);
+                    }
+                }
+                Poll::Ready(Some(Ok(Delta::with_kind(
+                    kind,
+                    (Arc::clone(&this.variables), result).into(),
+                ))))
+            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        };
+        if result.is_pending() {
+            if let Some(old_waker) = &this.cancellation_waker
+                && !old_waker.will_wake(cx.waker())
+            {
+                this.core
+                    .dataset
+                    .cancellation_token
+                    .unregister_waker(old_waker);
+            }
+            this.core
+                .dataset
+                .cancellation_token
+                .register_waker(cx.waker());
+            this.cancellation_waker = Some(cx.waker().clone());
+            if let Err(error) = this.core.dataset.cancellation_token.ensure_alive() {
+                return Poll::Ready(Some(Err(error)));
+            }
+        } else if let Some(waker) = this.cancellation_waker.take() {
+            this.core
+                .dataset
+                .cancellation_token
+                .unregister_waker(&waker);
+        }
+        result
+    }
+}
+
+struct SymmetricHashJoinStream<'a, T> {
+    left_iter: InternalTupleDeltasStream<'a, T>,
+    right_iter: InternalTupleDeltasStream<'a, T>,
     left_values: InternalTupleSet<T>,
     right_values: InternalTupleSet<T>,
     pending_values: Vec<(u64, Delta<InternalTuple<T>>)>,
-    buffered_results: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
+    buffered_results: Vec<Result<Delta<InternalTuple<T>>, QueryEvaluationError>>,
     left_done: bool,
     right_done: bool,
     active_side: JoinSide,
 }
 
-impl<T: Clone + Eq + Hash> Iterator for SymmetricHashJoinIterator<'_, T> {
-    type Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>;
+impl<T> Unpin for SymmetricHashJoinStream<'_, T> {}
 
-    fn next(&mut self) -> Option<Self::Item> {
+impl<T: Clone + Eq + Hash> Stream for SymmetricHashJoinStream<'_, T> {
+    type Item = Result<Delta<InternalTuple<T>>, QueryEvaluationError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         loop {
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
+            if let Some(result) = this.buffered_results.pop() {
+                return Poll::Ready(Some(result));
             }
-            if self.left_done && self.right_done {
-                return None;
-            }
-
-            let first_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
+            if this.left_done && this.right_done {
+                return Poll::Ready(None);
             }
 
-            self.active_side = self.active_side.other();
-            let second_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
+            let first_state = this.poll_active_side(cx);
+            if let Some(result) = this.buffered_results.pop() {
+                return Poll::Ready(Some(result));
             }
 
-            if self.left_done && self.right_done {
-                return None;
+            this.active_side = this.active_side.other();
+            let second_state = this.poll_active_side(cx);
+            if let Some(result) = this.buffered_results.pop() {
+                return Poll::Ready(Some(result));
+            }
+
+            if this.left_done && this.right_done {
+                return Poll::Ready(None);
             }
             if matches!(first_state, PollState::Pending | PollState::Done)
                 && matches!(second_state, PollState::Pending | PollState::Done)
             {
-                return Some(Ok(StreamingItem::Pending));
+                return Poll::Pending;
             }
         }
     }
 }
 
-impl<T: Clone + Eq + Hash> SymmetricHashJoinIterator<'_, T> {
-    fn poll_active_side(&mut self) -> PollState {
+impl<T: Clone + Eq + Hash> SymmetricHashJoinStream<'_, T> {
+    fn poll_active_side(&mut self, cx: &mut Context<'_>) -> PollState {
         let (iter, values, other_values, done) = match self.active_side {
             JoinSide::Left => (
                 &mut self.left_iter,
@@ -1035,8 +918,8 @@ impl<T: Clone + Eq + Hash> SymmetricHashJoinIterator<'_, T> {
         }
 
         while self.buffered_results.is_empty() {
-            match iter.next() {
-                Some(Ok(StreamingItem::Item(delta))) => {
+            match iter.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(delta))) => {
                     let key = other_values.tuple_key(delta.value());
                     let kind = delta.kind();
                     self.buffered_results.extend(
@@ -1044,18 +927,16 @@ impl<T: Clone + Eq + Hash> SymmetricHashJoinIterator<'_, T> {
                             .get(key)
                             .iter()
                             .filter_map(|other| delta.value().combine_with(other))
-                            .map(move |joined| {
-                                Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
-                            }),
+                            .map(move |joined| Ok(Delta::with_kind(kind, joined))),
                     );
                     self.pending_values.push((key, delta));
                 }
-                Some(Ok(StreamingItem::Pending)) => break,
-                Some(Err(error)) => {
+                Poll::Pending => break,
+                Poll::Ready(Some(Err(error))) => {
                     self.buffered_results.push(Err(error));
                     break;
                 }
-                None => {
+                Poll::Ready(None) => {
                     *done = true;
                     break;
                 }
@@ -1101,19 +982,19 @@ impl JoinSide {
     }
 }
 
-struct SymmetricNestedLoopJoinIterator<'a, T> {
-    left_iter: InternalTupleDeltasIterator<'a, T>,
-    right_iter: InternalTupleDeltasIterator<'a, T>,
+struct SymmetricNestedLoopJoinStream<'a, T> {
+    left_iter: InternalTupleDeltasStream<'a, T>,
+    right_iter: InternalTupleDeltasStream<'a, T>,
     left_values: Vec<InternalTuple<T>>,
     right_values: Vec<InternalTuple<T>>,
-    buffered_results: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
+    buffered_results: Vec<Result<Delta<InternalTuple<T>>, QueryEvaluationError>>,
     left_done: bool,
     right_done: bool,
     active_side: JoinSide,
 }
 
-impl<T: Clone + Eq> SymmetricNestedLoopJoinIterator<'_, T> {
-    fn poll_active_side(&mut self) -> PollState {
+impl<T: Clone + Eq> SymmetricNestedLoopJoinStream<'_, T> {
+    fn poll_active_side(&mut self, cx: &mut Context<'_>) -> PollState {
         let active_side = self.active_side;
         let (iter, values, other_values, done) = match active_side {
             JoinSide::Left => (
@@ -1134,8 +1015,8 @@ impl<T: Clone + Eq> SymmetricNestedLoopJoinIterator<'_, T> {
         }
 
         while self.buffered_results.is_empty() {
-            match iter.next() {
-                Some(Ok(StreamingItem::Item(delta))) => {
+            match iter.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(delta))) => {
                     let (kind, tuple) = delta.into_parts();
                     let joined = |other: &InternalTuple<T>| match active_side {
                         JoinSide::Left => tuple.combine_with(other),
@@ -1144,9 +1025,10 @@ impl<T: Clone + Eq> SymmetricNestedLoopJoinIterator<'_, T> {
                     match kind {
                         DeltaKind::Addition => {
                             self.buffered_results.extend(
-                                other_values.iter().filter_map(joined).map(move |joined| {
-                                    Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
-                                }),
+                                other_values
+                                    .iter()
+                                    .filter_map(joined)
+                                    .map(move |joined| Ok(Delta::with_kind(kind, joined))),
                             );
                             values.push(tuple);
                         }
@@ -1155,20 +1037,21 @@ impl<T: Clone + Eq> SymmetricNestedLoopJoinIterator<'_, T> {
                             {
                                 values.swap_remove(position);
                                 self.buffered_results.extend(
-                                    other_values.iter().filter_map(joined).map(move |joined| {
-                                        Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
-                                    }),
+                                    other_values
+                                        .iter()
+                                        .filter_map(joined)
+                                        .map(move |joined| Ok(Delta::with_kind(kind, joined))),
                                 );
                             }
                         }
                     }
                 }
-                Some(Ok(StreamingItem::Pending)) => break,
-                Some(Err(error)) => {
+                Poll::Pending => break,
+                Poll::Ready(Some(Err(error))) => {
                     self.buffered_results.push(Err(error));
                     break;
                 }
-                None => {
+                Poll::Ready(None) => {
                     *done = true;
                     break;
                 }
@@ -1187,36 +1070,39 @@ impl<T: Clone + Eq> SymmetricNestedLoopJoinIterator<'_, T> {
     }
 }
 
-impl<T: Clone + Eq> Iterator for SymmetricNestedLoopJoinIterator<'_, T> {
-    type Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>;
+impl<T> Unpin for SymmetricNestedLoopJoinStream<'_, T> {}
 
-    fn next(&mut self) -> Option<Self::Item> {
+impl<T: Clone + Eq> Stream for SymmetricNestedLoopJoinStream<'_, T> {
+    type Item = Result<Delta<InternalTuple<T>>, QueryEvaluationError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         loop {
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
+            if let Some(result) = this.buffered_results.pop() {
+                return Poll::Ready(Some(result));
             }
-            if self.left_done && self.right_done {
-                return None;
-            }
-
-            let first_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
+            if this.left_done && this.right_done {
+                return Poll::Ready(None);
             }
 
-            self.active_side = self.active_side.other();
-            let second_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
+            let first_state = this.poll_active_side(cx);
+            if let Some(result) = this.buffered_results.pop() {
+                return Poll::Ready(Some(result));
             }
 
-            if self.left_done && self.right_done {
-                return None;
+            this.active_side = this.active_side.other();
+            let second_state = this.poll_active_side(cx);
+            if let Some(result) = this.buffered_results.pop() {
+                return Poll::Ready(Some(result));
+            }
+
+            if this.left_done && this.right_done {
+                return Poll::Ready(None);
             }
             if matches!(first_state, PollState::Pending | PollState::Done)
                 && matches!(second_state, PollState::Pending | PollState::Done)
             {
-                return Some(Ok(StreamingItem::Pending));
+                return Poll::Pending;
             }
         }
     }
@@ -1285,26 +1171,31 @@ impl<T: Hash + Eq> InternalTupleSet<T> {
     }
 }
 
-struct StatsDeltaIterator<'a, T> {
-    inner: InternalTupleDeltasIterator<'a, T>,
+struct StatsDeltaStream<'a, T> {
+    inner: InternalTupleDeltasStream<'a, T>,
     stats: Rc<EvalNodeWithStats>,
 }
 
-impl<T> Iterator for StatsDeltaIterator<'_, T> {
-    type Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>;
+impl<T> Unpin for StatsDeltaStream<'_, T> {}
 
-    fn next(&mut self) -> Option<Self::Item> {
+impl<T> Stream for StatsDeltaStream<'_, T> {
+    type Item = Result<Delta<InternalTuple<T>>, QueryEvaluationError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         let start = Timer::now();
-        let result = self.inner.next();
-        let duration = start.elapsed()?;
-        self.stats.exec_duration.set(
-            self.stats
+        let result = this.inner.as_mut().poll_next(cx);
+        let Some(duration) = start.elapsed() else {
+            return Poll::Ready(None);
+        };
+        this.stats.exec_duration.set(
+            this.stats
                 .exec_duration
                 .get()
                 .and_then(|d| d.checked_add(duration)),
         );
-        if let Some(Ok(StreamingItem::Item(_))) = &result {
-            self.stats.exec_count.set(self.stats.exec_count.get() + 1);
+        if matches!(&result, Poll::Ready(Some(Ok(_)))) {
+            this.stats.exec_count.set(this.stats.exec_count.get() + 1);
         }
         result
     }
