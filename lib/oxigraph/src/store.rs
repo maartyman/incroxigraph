@@ -1,6 +1,8 @@
 //! API to access an on-disk [RDF dataset](https://www.w3.org/TR/rdf11-concepts/#dfn-rdf-dataset).
 //!
 //! The entry point of the module is the [`Store`] struct.
+//! For queries that follow committed changes, see
+//! [incremental SPARQL queries](crate::sparql#incremental-queries).
 //!
 //! Usage example:
 //! ```
@@ -66,6 +68,8 @@ use std::thread::available_parallelism;
 /// An on-disk [RDF dataset](https://www.w3.org/TR/rdf11-concepts/#dfn-rdf-dataset).
 /// Allows querying and updating it using SPARQL.
 /// It is based on the [RocksDB](https://rocksdb.org/) key-value store.
+/// See [incremental SPARQL queries](crate::sparql#incremental-queries) to follow committed
+/// changes with a long-lived query.
 ///
 /// This store ensures the "repeatable read" isolation level: the store only exposes changes that have
 /// been "committed" (i.e., no partial writes), and the exposed state does not change for the complete duration

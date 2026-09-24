@@ -413,6 +413,10 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalDriverCore<'a, D> {
     }
 }
 
+/// Low-level driver for incremental SELECT changes.
+///
+/// After any polling error, stop using and drop the driver. Polling again has no
+/// recovery guarantee, including after cancellation.
 pub struct IncrementalSelectDriver<'a, D: IncrementalQueryableDataset<'a>> {
     core: IncrementalDriverCore<'a, D>,
     variables: Arc<[Variable]>,
@@ -919,6 +923,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectDriver<'a, D> {
             .changed_since(baseline, &self.core.dataset.cancellation_token)
     }
 
+    /// Polls for the next change. Drop the driver if this returns an error.
     pub fn poll_next(
         &mut self,
     ) -> Result<IncrementalDriverState<QuerySolutionChange>, QueryEvaluationError> {

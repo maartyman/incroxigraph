@@ -19,8 +19,9 @@ pub use crate::dataset::{
     ExpressionTerm, IncrementalQueryableDataset, InternalQuad, InternalTriple, QueryableDataset,
 };
 pub use crate::delta_model::{
-    Delta, DeltaKind, IncrementalSelectDeltasIter, IncrementalSelectDeltasState,
-    IncrementalSelectResults, IncrementalSelectResultsIter, IncrementalSelectResultsState,
+    Delta, DeltaKind, IncrementalGraphResults, IncrementalQueryDeltasIter,
+    IncrementalQueryDeltasState, IncrementalQueryResults, IncrementalQueryResultsIter,
+    IncrementalQueryResultsState, IncrementalSelectResults, QueryBooleanDeltaIter,
     QueryResultsDelta, QuerySolutionDeltaIter, QueryTripleDeltaIter,
 };
 pub use crate::error::QueryEvaluationError;
@@ -653,19 +654,19 @@ impl PreparedQuery<'_> {
         self.explain(dataset).0
     }
 
-    /// Execute a SELECT query incrementally and return state for complete result snapshots.
+    /// Execute a SELECT, ASK, or CONSTRUCT query incrementally and return complete result snapshots.
     pub fn execute_incremental_results<'b, D: IncrementalQueryableDataset<'b>>(
         self,
         dataset: D,
-    ) -> Result<IncrementalSelectResultsState<'b, D>, QueryEvaluationError> {
+    ) -> Result<IncrementalQueryResultsState<'b, D>, QueryEvaluationError> {
         self.explain_incremental_results(dataset).0
     }
 
-    /// Execute a SELECT query incrementally and return state for result deltas.
+    /// Execute a SELECT, ASK, or CONSTRUCT query incrementally and return state for result deltas.
     pub fn execute_incremental_deltas<'b, D: IncrementalQueryableDataset<'b>>(
         self,
         dataset: D,
-    ) -> Result<IncrementalSelectDeltasState<'b, D>, QueryEvaluationError> {
+    ) -> Result<IncrementalQueryDeltasState<'b, D>, QueryEvaluationError> {
         self.explain_incremental_deltas(dataset).0
     }
 
@@ -680,31 +681,49 @@ impl PreparedQuery<'_> {
         self.explain_incremental_driver(dataset).0
     }
 
-    /// Execute a SELECT query incrementally and return a [`QueryExplanation`] with optional
+    /// Execute a SELECT, ASK, or CONSTRUCT query incrementally and return a [`QueryExplanation`] with optional
     /// statistics. If statistics are enabled with [`QueryEvaluator::compute_statistics`], callers
     /// should drain the returned state before serializing the explanation.
     pub fn explain_incremental_results<'b, D: IncrementalQueryableDataset<'b>>(
         self,
         dataset: D,
     ) -> (
-        Result<IncrementalSelectResultsState<'b, D>, QueryEvaluationError>,
+        Result<IncrementalQueryResultsState<'b, D>, QueryEvaluationError>,
         QueryExplanation,
     ) {
-        let (driver, explanation) = self.explain_incremental_driver(dataset);
-        (driver.map(IncrementalSelectResultsState::new), explanation)
+        let (driver, explanation) = explain_incremental_query(self, dataset);
+        (
+            driver.map(|(driver, kind)| match kind {
+                IncrementalQueryKind::Select => IncrementalQueryResultsState::new_select(driver),
+                IncrementalQueryKind::Ask => IncrementalQueryResultsState::new_ask(driver),
+                IncrementalQueryKind::Construct(template) => {
+                    IncrementalQueryResultsState::new_construct(driver, template)
+                }
+            }),
+            explanation,
+        )
     }
 
-    /// Execute a SELECT query incrementally and return a [`QueryExplanation`] with optional
-    /// statistics, along with state for query deltas.
+    /// Execute a query incrementally and return a [`QueryExplanation`] with optional statistics,
+    /// along with state for query deltas.
     pub fn explain_incremental_deltas<'b, D: IncrementalQueryableDataset<'b>>(
         self,
         dataset: D,
     ) -> (
-        Result<IncrementalSelectDeltasState<'b, D>, QueryEvaluationError>,
+        Result<IncrementalQueryDeltasState<'b, D>, QueryEvaluationError>,
         QueryExplanation,
     ) {
-        let (driver, explanation) = self.explain_incremental_driver(dataset);
-        (driver.map(IncrementalSelectDeltasState::new), explanation)
+        let (driver, explanation) = explain_incremental_query(self, dataset);
+        (
+            driver.map(|(driver, kind)| match kind {
+                IncrementalQueryKind::Select => IncrementalQueryDeltasState::new_select(driver),
+                IncrementalQueryKind::Ask => IncrementalQueryDeltasState::new_ask(driver),
+                IncrementalQueryKind::Construct(template) => {
+                    IncrementalQueryDeltasState::new_construct(driver, template)
+                }
+            }),
+            explanation,
+        )
     }
 
     /// Execute a SELECT query incrementally using the low-level polling driver and return a
@@ -716,53 +735,21 @@ impl PreparedQuery<'_> {
         Result<IncrementalSelectDriver<'b, D>, QueryEvaluationError>,
         QueryExplanation,
     ) {
-        let start_planning = Timer::now();
         match self.query {
-            Query::Select(query) => {
-                let mut pattern = QueryExpression::from(&query.expression);
-                if !self.evaluator.without_optimizations {
-                    pattern = Optimizer::optimize_query_expression(pattern);
-                }
-                let planning_duration = start_planning.elapsed();
-                let evaluator = match self.evaluator.incremental_evaluator(
-                    dataset,
-                    self.dataset,
-                    query.base_iri.as_ref(),
-                ) {
-                    Ok(evaluator) => evaluator,
-                    Err(error) => {
-                        return (
-                            Err(error),
-                            QueryExplanation {
-                                inner: Rc::new(EvalNodeWithStats::empty()),
-                                with_stats: self.evaluator.run_stats,
-                                planning_duration,
-                            },
-                        );
-                    }
-                };
-                let (driver, explanation) =
-                    evaluator.evaluate_select_driver(&pattern, self.substitutions);
-                (
-                    driver,
-                    QueryExplanation {
-                        inner: explanation,
-                        with_stats: self.evaluator.run_stats,
-                        planning_duration,
-                    },
+            Query::Select(query) => explain_incremental_expression(
+                self.evaluator,
+                &query.expression,
+                query.base_iri.as_ref(),
+                dataset,
+                self.dataset,
+                self.substitutions,
+            ),
+            Query::Ask(_) | Query::Construct(_) | Query::Describe(_) => {
+                unsupported_incremental_query(
+                    self.evaluator,
+                    "the low-level incremental driver supports only SELECT queries",
                 )
             }
-            _ => (
-                Err(QueryEvaluationError::Unexpected(Box::new(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "incremental execution currently supports only SELECT queries",
-                )))),
-                QueryExplanation {
-                    inner: Rc::new(EvalNodeWithStats::empty()),
-                    with_stats: self.evaluator.run_stats,
-                    planning_duration: start_planning.elapsed(),
-                },
-            ),
         }
     }
 
@@ -865,6 +852,113 @@ impl PreparedQuery<'_> {
         };
         (results, explanation)
     }
+}
+
+enum IncrementalQueryKind {
+    Select,
+    Ask,
+    Construct(Vec<spargebra::term::TripleTemplate>),
+}
+
+fn explain_incremental_query<'a, D: IncrementalQueryableDataset<'a>>(
+    query: PreparedQuery<'_>,
+    dataset: D,
+) -> (
+    Result<(IncrementalSelectDriver<'a, D>, IncrementalQueryKind), QueryEvaluationError>,
+    QueryExplanation,
+) {
+    let (expression, base_iri, kind) = match query.query {
+        Query::Select(select) => (
+            &select.expression,
+            select.base_iri.as_ref(),
+            IncrementalQueryKind::Select,
+        ),
+        Query::Ask(ask) => (
+            &ask.expression,
+            ask.base_iri.as_ref(),
+            IncrementalQueryKind::Ask,
+        ),
+        Query::Construct(construct) => (
+            &construct.expression,
+            construct.base_iri.as_ref(),
+            IncrementalQueryKind::Construct(construct.template.clone()),
+        ),
+        Query::Describe(_) => {
+            return unsupported_incremental_query(
+                query.evaluator,
+                "incremental execution does not currently support DESCRIBE queries",
+            );
+        }
+    };
+    let (driver, explanation) = explain_incremental_expression(
+        query.evaluator,
+        expression,
+        base_iri,
+        dataset,
+        query.dataset,
+        query.substitutions,
+    );
+    (driver.map(|driver| (driver, kind)), explanation)
+}
+
+fn explain_incremental_expression<'a, D: IncrementalQueryableDataset<'a>>(
+    evaluator: &QueryEvaluator,
+    expression: &spargebra::algebra::QueryExpression,
+    base_iri: Option<&Iri<OxString>>,
+    dataset: D,
+    dataset_spec: QueryDatasetSpecification,
+    substitutions: HashMap<Variable, Term>,
+) -> (
+    Result<IncrementalSelectDriver<'a, D>, QueryEvaluationError>,
+    QueryExplanation,
+) {
+    let start_planning = Timer::now();
+    let mut pattern = QueryExpression::from(expression);
+    if !evaluator.without_optimizations {
+        pattern = Optimizer::optimize_query_expression(pattern);
+    }
+    let planning_duration = start_planning.elapsed();
+    let incremental_evaluator =
+        match evaluator.incremental_evaluator(dataset, dataset_spec, base_iri) {
+            Ok(evaluator) => evaluator,
+            Err(error) => {
+                return (
+                    Err(error),
+                    QueryExplanation {
+                        inner: Rc::new(EvalNodeWithStats::empty()),
+                        with_stats: evaluator.run_stats,
+                        planning_duration,
+                    },
+                );
+            }
+        };
+    let (driver, explanation) =
+        incremental_evaluator.evaluate_select_driver(&pattern, substitutions);
+    (
+        driver,
+        QueryExplanation {
+            inner: explanation,
+            with_stats: evaluator.run_stats,
+            planning_duration,
+        },
+    )
+}
+
+fn unsupported_incremental_query<T>(
+    evaluator: &QueryEvaluator,
+    message: &'static str,
+) -> (Result<T, QueryEvaluationError>, QueryExplanation) {
+    (
+        Err(QueryEvaluationError::Unexpected(Box::new(io::Error::new(
+            io::ErrorKind::Unsupported,
+            message,
+        )))),
+        QueryExplanation {
+            inner: Rc::new(EvalNodeWithStats::empty()),
+            with_stats: evaluator.run_stats,
+            planning_duration: Timer::now().elapsed(),
+        },
+    )
 }
 
 /// A prepared SPARQL query.

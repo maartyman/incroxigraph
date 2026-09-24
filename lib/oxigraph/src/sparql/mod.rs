@@ -1,6 +1,157 @@
 //! [SPARQL](https://www.w3.org/TR/sparql11-overview/) implementation.
 //!
 //! The entry point for SPARQL execution is the [`SparqlEvaluator`] type.
+//!
+//! # Incremental queries
+//!
+//! An incremental query keeps a handle to its results as the [`Store`] changes. Parse a
+//! `SELECT`, `ASK`, or `CONSTRUCT` query, bind it with
+//! [`PreparedSparqlQuery::on_store`], and choose one of two views:
+//!
+//! - [`BoundPreparedSparqlQuery::execute_incremental_results`] retains the current results.
+//!   Call [`IncrementalQueryResultsState::results`] for an initial snapshot and again after
+//!   changes. A returned snapshot borrows the state, so consume it before calling `results()`
+//!   again.
+//! - [`BoundPreparedSparqlQuery::execute_incremental_deltas`] returns additions and deletions
+//!   since the previous call. Its batches own their data, so they can be processed after the
+//!   state is dropped. This view does not retain a complete result set for you.
+//!
+//! For example, a `SELECT` snapshot tracks both the initial state and later writes:
+//!
+//! ```
+//! use oxigraph::model::{GraphName, NamedNode, Quad};
+//! use oxigraph::sparql::{IncrementalQueryResults, SparqlEvaluator};
+//! use oxigraph::store::Store;
+//!
+//! let store = Store::new()?;
+//! let mut query = SparqlEvaluator::new()
+//!     .parse_query("SELECT ?s WHERE { ?s <urn:p> <urn:o> }")?
+//!     .on_store(&store)
+//!     .execute_incremental_results()?;
+//!
+//! let IncrementalQueryResults::Solutions(rows) = query.results()? else {
+//!     unreachable!()
+//! };
+//! assert_eq!(rows.count(), 0);
+//!
+//! let subject = NamedNode::new("urn:s")?;
+//! store.insert(Quad::new(
+//!     subject.clone(),
+//!     NamedNode::new("urn:p")?,
+//!     NamedNode::new("urn:o")?,
+//!     GraphName::DefaultGraph,
+//! ))?;
+//! let IncrementalQueryResults::Solutions(mut rows) = query.results()? else {
+//!     unreachable!()
+//! };
+//! assert_eq!(rows.next().unwrap().get("s"), Some(&subject.into()));
+//! # Result::<_, Box<dyn std::error::Error>>::Ok(())
+//! ```
+//!
+//! Use deltas when maintaining your own view of the results. `SELECT` yields row additions and
+//! deletions, `ASK` yields a boolean only when its value changes (after an initial boolean), and
+//! `CONSTRUCT` yields triple additions and deletions using graph set semantics:
+//!
+//! ```
+//! use oxigraph::model::{GraphName, NamedNode, Quad};
+//! use oxigraph::sparql::{Delta, QueryResultsDelta, SparqlEvaluator};
+//! use oxigraph::store::Store;
+//!
+//! let store = Store::new()?;
+//! let mut query = SparqlEvaluator::new()
+//!     .parse_query("SELECT ?s WHERE { ?s <urn:p> <urn:o> }")?
+//!     .on_store(&store)
+//!     .execute_incremental_deltas()?;
+//! let QueryResultsDelta::Solutions(initial) = query.deltas()? else { unreachable!() };
+//! assert_eq!(initial.count(), 0);
+//!
+//! store.insert(Quad::new(
+//!     NamedNode::new("urn:s")?,
+//!     NamedNode::new("urn:p")?,
+//!     NamedNode::new("urn:o")?,
+//!     GraphName::DefaultGraph,
+//! ))?;
+//! let QueryResultsDelta::Solutions(changes) = query.deltas()? else { unreachable!() };
+//! for change in changes {
+//!     match change? {
+//!         Delta::Addition(solution) => assert!(solution.get("s").is_some()),
+//!         Delta::Deletion(_) => unreachable!(),
+//!     }
+//! }
+//! # Result::<_, Box<dyn std::error::Error>>::Ok(())
+//! ```
+//!
+//! `ASK` and `CONSTRUCT` use the same entry point, with different delta variants:
+//!
+//! ```
+//! use oxigraph::model::{GraphName, NamedNode, Quad};
+//! use oxigraph::sparql::{Delta, QueryResultsDelta, SparqlEvaluator};
+//! use oxigraph::store::Store;
+//!
+//! let store = Store::new()?;
+//! let mut ask = SparqlEvaluator::new()
+//!     .parse_query("ASK { ?s <urn:p> ?o }")?
+//!     .on_store(&store)
+//!     .execute_incremental_deltas()?;
+//! let mut construct = SparqlEvaluator::new()
+//!     .parse_query("CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }")?
+//!     .on_store(&store)
+//!     .execute_incremental_deltas()?;
+//! let QueryResultsDelta::Boolean(initial) = ask.deltas()? else { unreachable!() };
+//! assert_eq!(initial.collect::<Result<Vec<_>, _>>()?, [false]);
+//!
+//! store.insert(Quad::new(
+//!     NamedNode::new("urn:s")?,
+//!     NamedNode::new("urn:p")?,
+//!     NamedNode::new("urn:o")?,
+//!     GraphName::DefaultGraph,
+//! ))?;
+//! let QueryResultsDelta::Boolean(values) = ask.deltas()? else { unreachable!() };
+//! assert_eq!(values.collect::<Result<Vec<_>, _>>()?, [true]);
+//! let QueryResultsDelta::Graph(triples) = construct.deltas()? else { unreachable!() };
+//! assert!(matches!(triples.collect::<Result<Vec<_>, _>>()?.as_slice(), [Delta::Addition(_)]));
+//! # Result::<_, Box<dyn std::error::Error>>::Ok(())
+//! ```
+//!
+//! To wait instead of polling, call [`IncrementalQueryResultsState::iter_results`] or
+//! [`IncrementalQueryDeltasState::iter_deltas`] and await `next()`. Snapshot iteration yields
+//! its initial result, even when empty; delta iteration waits for a non-empty `SELECT` or
+//! `CONSTRUCT` batch. `ASK` deltas yield the initial boolean. A call drains all changes ready
+//! at that time and may combine several commits; it does not report every intermediate value.
+//! An asynchronous consumer can stop on an error by returning it from its task:
+//!
+//! ```no_run
+//! use oxigraph::sparql::{QueryResultsDelta, SparqlEvaluator};
+//! use oxigraph::store::Store;
+//!
+//! async fn watch(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
+//!     let mut query = SparqlEvaluator::new()
+//!         .parse_query("SELECT ?s WHERE { ?s <urn:p> ?o }")?
+//!         .on_store(store)
+//!         .execute_incremental_deltas()?;
+//!     let mut batches = query.iter_deltas();
+//!     while let Some(batch) = batches.next().await {
+//!         if let QueryResultsDelta::Solutions(rows) = batch? {
+//!             for row in rows {
+//!                 let change = row?;
+//!                 // Update an application-owned cache using change.
+//!                 let _ = change;
+//!             }
+//!         }
+//!     }
+//!     Ok(())
+//! }
+//! # let _ = watch;
+//! ```
+//!
+//! Store-bound queries observe committed changes, while a query bound to a transaction sees
+//! its isolated snapshot and then finishes. The handles are not `Send`, so create and drive
+//! them on the thread that owns them.
+//!
+//! If `results()`, `deltas()`, or an asynchronous `next()` returns an error, stop and drop the
+//! handle. The current batch may have been partly consumed, and a later call has no recovery
+//! guarantee. Cancellation does not automatically end the iterator: polling again can return
+//! another cancellation error immediately.
 
 mod dataset;
 mod error;
@@ -18,11 +169,12 @@ use crate::sparql::http::HttpServiceHandler;
 pub use crate::sparql::update::{BoundPreparedSparqlUpdate, PreparedSparqlUpdate};
 use crate::store::{Store, Transaction};
 pub use spareval::{
-    AggregateFunctionAccumulator, CancellationToken, DefaultServiceHandler, Delta,
-    IncrementalDriverState, IncrementalSelectDeltasIter, IncrementalSelectDeltasState,
-    IncrementalSelectDriver, IncrementalSelectResultsIter, IncrementalSelectResultsState,
-    QueryDatasetSpecification, QueryEvaluationError, QueryExplanation, QueryResults,
-    QueryResultsDelta, QuerySolution, QuerySolutionDeltaIter, QuerySolutionIter,
+    AggregateFunctionAccumulator, CancellationToken, DefaultServiceHandler, Delta, DeltaKind,
+    IncrementalDriverState, IncrementalGraphResults, IncrementalQueryDeltasIter,
+    IncrementalQueryDeltasState, IncrementalQueryResults, IncrementalQueryResultsIter,
+    IncrementalQueryResultsState, IncrementalSelectDriver, IncrementalSelectResults,
+    QueryBooleanDeltaIter, QueryDatasetSpecification, QueryEvaluationError, QueryExplanation,
+    QueryResults, QueryResultsDelta, QuerySolution, QuerySolutionDeltaIter, QuerySolutionIter,
     QueryTripleDeltaIter, QueryTripleIter, ServiceHandler,
 };
 use spareval::{IncrementalQueryableDataset, QueryEvaluator, QueryableDataset};
@@ -35,6 +187,14 @@ use std::mem::take;
 use std::time::Duration;
 
 pub type QueryDataset = QueryDatasetSpecification;
+
+/// State for the deltas of an incremental query executed against a [`Store`].
+pub type StoreIncrementalQueryDeltasState =
+    IncrementalQueryDeltasState<'static, DatasetView<'static>>;
+
+/// State for complete incremental query results executed against a [`Store`].
+pub type StoreIncrementalQueryResultsState =
+    IncrementalQueryResultsState<'static, DatasetView<'static>>;
 
 /// SPARQL evaluator.
 ///
@@ -752,7 +912,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
     /// Evaluate the query incrementally and return state for complete result snapshots.
     pub fn execute_incremental_results(
         self,
-    ) -> Result<IncrementalSelectResultsState<'a, D>, QueryEvaluationError> {
+    ) -> Result<IncrementalQueryResultsState<'a, D>, QueryEvaluationError> {
         let mut prepared = self.evaluator.prepare(&self.query);
         for (variable, term) in self.substitutions {
             prepared = prepared.substitute_variable(variable, term);
@@ -764,7 +924,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
     /// Evaluate the query incrementally and return state for result deltas.
     pub fn execute_incremental_deltas(
         self,
-    ) -> Result<IncrementalSelectDeltasState<'a, D>, QueryEvaluationError> {
+    ) -> Result<IncrementalQueryDeltasState<'a, D>, QueryEvaluationError> {
         let mut prepared = self.evaluator.prepare(&self.query);
         for (variable, term) in self.substitutions {
             prepared = prepared.substitute_variable(variable, term);
@@ -777,7 +937,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
     pub fn explain_incremental_results(
         self,
     ) -> (
-        Result<IncrementalSelectResultsState<'a, D>, QueryEvaluationError>,
+        Result<IncrementalQueryResultsState<'a, D>, QueryEvaluationError>,
         QueryExplanation,
     ) {
         let mut prepared = self.evaluator.prepare(&self.query);
@@ -792,7 +952,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
     pub fn explain_incremental_deltas(
         self,
     ) -> (
-        Result<IncrementalSelectDeltasState<'a, D>, QueryEvaluationError>,
+        Result<IncrementalQueryDeltasState<'a, D>, QueryEvaluationError>,
         QueryExplanation,
     ) {
         let mut prepared = self.evaluator.prepare(&self.query);

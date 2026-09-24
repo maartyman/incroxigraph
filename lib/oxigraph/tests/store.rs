@@ -5,7 +5,11 @@ use oxigraph::io::RdfFormat;
 use oxigraph::model::vocab::{rdf, xsd};
 use oxigraph::model::*;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::sparql::QueryResults;
+use oxigraph::sparql::{
+    Delta, IncrementalQueryResults, QueryResultsDelta, SparqlEvaluator,
+    StoreIncrementalQueryDeltasState, StoreIncrementalQueryResultsState,
+};
 use oxigraph::store::Store;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use oxigraph::store::StoreOptions;
@@ -21,6 +25,7 @@ use std::fs::{File, create_dir_all, read_dir, remove_dir};
     feature = "rocksdb"
 ))]
 use std::fs::{read, write};
+use std::future::Future;
 #[cfg(all(
     target_os = "linux",
     target_pointer_width = "64",
@@ -40,6 +45,7 @@ use std::iter::once;
     feature = "rocksdb"
 ))]
 use std::path::PathBuf;
+use std::task::{Context, Poll, Waker};
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use tempfile::TempDir;
 
@@ -57,6 +63,278 @@ wd:Q90 a schema:City ;
     schema:url "https://www.paris.fr/"^^xsd:anyURI ;
     schema:postalCode "75001" .
 "#;
+
+#[test]
+fn incremental_query_deltas_support_all_result_kinds() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+
+    let mut select = SparqlEvaluator::new()
+        .parse_query("SELECT * WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    assert_store_incremental_state(&select);
+    let QueryResultsDelta::Solutions(values) = select.deltas()? else {
+        unreachable!("expected solution deltas")
+    };
+    assert_eq!(values.count(), 0);
+
+    let mut ask = SparqlEvaluator::new()
+        .parse_query("ASK { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let QueryResultsDelta::Boolean(values) = ask.deltas()? else {
+        unreachable!("expected boolean deltas")
+    };
+    assert_eq!(values.collect::<Result<Vec<_>, _>>()?, [false]);
+
+    let quad = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    store.insert(quad.clone())?;
+
+    let QueryResultsDelta::Boolean(values) = ask.deltas()? else {
+        unreachable!("expected boolean deltas")
+    };
+    assert_eq!(values.collect::<Result<Vec<_>, _>>()?, [true]);
+
+    let mut construct = SparqlEvaluator::new()
+        .parse_query("CONSTRUCT { _:b <urn:q> ?o } WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let QueryResultsDelta::Graph(values) = construct.deltas()? else {
+        unreachable!("expected graph deltas")
+    };
+    let initial = values.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(initial.len(), 1);
+    let Delta::Addition(initial) = &initial[0] else {
+        unreachable!("expected a triple addition")
+    };
+    assert!(initial.subject.is_blank_node());
+
+    store.remove(&quad)?;
+    let QueryResultsDelta::Graph(values) = construct.deltas()? else {
+        unreachable!("expected graph deltas")
+    };
+    let removed = values.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(removed.len(), 1);
+    let Delta::Deletion(removed) = &removed[0] else {
+        unreachable!("expected a triple deletion")
+    };
+    assert_eq!(removed, initial);
+    Ok(())
+}
+
+fn assert_store_incremental_state(_: &StoreIncrementalQueryDeltasState) {}
+
+#[test]
+fn incremental_query_results_support_all_result_kinds() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut select = SparqlEvaluator::new()
+        .parse_query("SELECT * WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let mut ask = SparqlEvaluator::new()
+        .parse_query("ASK { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let mut construct = SparqlEvaluator::new()
+        .parse_query("CONSTRUCT { _:b <urn:q> ?o } WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    assert_store_incremental_results_state(&select);
+
+    assert_eq!(select.variables().map(<[_]>::len), Some(2));
+    let IncrementalQueryResults::Solutions(solutions) = select.results()? else {
+        unreachable!("expected SELECT results")
+    };
+    assert_eq!(solutions.count(), 0);
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(false)
+    ));
+    let IncrementalQueryResults::Graph(triples) = construct.results()? else {
+        unreachable!("expected CONSTRUCT results")
+    };
+    assert_eq!(triples.count(), 0);
+
+    let quad = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    store.insert(quad.clone())?;
+    let IncrementalQueryResults::Solutions(solutions) = select.results()? else {
+        unreachable!("expected SELECT results")
+    };
+    assert_eq!(solutions.count(), 1);
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(true)
+    ));
+    let IncrementalQueryResults::Graph(triples) = construct.results()? else {
+        unreachable!("expected CONSTRUCT results")
+    };
+    let initial: Vec<_> = triples.cloned().collect();
+    assert_eq!(initial.len(), 1);
+    assert!(initial[0].subject.is_blank_node());
+
+    store.remove(&quad)?;
+    let IncrementalQueryResults::Solutions(solutions) = select.results()? else {
+        unreachable!("expected SELECT results")
+    };
+    assert_eq!(solutions.count(), 0);
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(false)
+    ));
+    let IncrementalQueryResults::Graph(triples) = construct.results()? else {
+        unreachable!("expected CONSTRUCT results")
+    };
+    assert_eq!(triples.count(), 0);
+    Ok(())
+}
+
+fn assert_store_incremental_results_state(_: &StoreIncrementalQueryResultsState) {}
+
+#[test]
+fn incremental_query_results_keep_boolean_and_graph_set_semantics() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut ask = SparqlEvaluator::new()
+        .parse_query("ASK { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let mut construct = SparqlEvaluator::new()
+        .parse_query("CONSTRUCT { <urn:result> <urn:q> <urn:value> } WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let first = Quad::new(
+        NamedNode::new_unchecked("urn:s1"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o1"),
+        GraphName::DefaultGraph,
+    );
+    let second = Quad::new(
+        NamedNode::new_unchecked("urn:s2"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o2"),
+        GraphName::DefaultGraph,
+    );
+
+    store.insert(first.clone())?;
+    store.insert(second.clone())?;
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(true)
+    ));
+    assert_eq!(graph_result_count(construct.results()?), 1);
+
+    store.remove(&first)?;
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(true)
+    ));
+    assert_eq!(graph_result_count(construct.results()?), 1);
+
+    store.remove(&second)?;
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(false)
+    ));
+    assert_eq!(graph_result_count(construct.results()?), 0);
+    Ok(())
+}
+
+fn graph_result_count(results: IncrementalQueryResults<'_>) -> usize {
+    let IncrementalQueryResults::Graph(triples) = results else {
+        unreachable!("expected CONSTRUCT results")
+    };
+    triples.count()
+}
+
+#[test]
+fn incremental_query_results_iterator_emits_initial_and_changed_snapshots()
+-> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut ask = SparqlEvaluator::new()
+        .parse_query("ASK { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let mut snapshots = ask.iter_results();
+    assert!(matches!(
+        poll_ready(snapshots.next()),
+        Some(Ok(IncrementalQueryResults::Boolean(false)))
+    ));
+
+    let quad = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    store.insert(quad.clone())?;
+    assert!(matches!(
+        poll_ready(snapshots.next()),
+        Some(Ok(IncrementalQueryResults::Boolean(true)))
+    ));
+    store.remove(&quad)?;
+    assert!(matches!(
+        poll_ready(snapshots.next()),
+        Some(Ok(IncrementalQueryResults::Boolean(false)))
+    ));
+    Ok(())
+}
+
+fn poll_ready<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(value) => value,
+        Poll::Pending => unreachable!("the dataset change should already be ready"),
+    }
+}
+
+#[test]
+fn incremental_construct_deltas_have_graph_set_semantics() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut state = SparqlEvaluator::new()
+        .parse_query("CONSTRUCT { <urn:result> <urn:q> <urn:value> } WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+
+    let first = Quad::new(
+        NamedNode::new_unchecked("urn:s1"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o1"),
+        GraphName::DefaultGraph,
+    );
+    let second = Quad::new(
+        NamedNode::new_unchecked("urn:s2"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o2"),
+        GraphName::DefaultGraph,
+    );
+
+    store.insert(first.clone())?;
+    assert_eq!(graph_delta_count(state.deltas()?), 1);
+    store.insert(second.clone())?;
+    assert_eq!(graph_delta_count(state.deltas()?), 0);
+    store.remove(&first)?;
+    assert_eq!(graph_delta_count(state.deltas()?), 0);
+    store.remove(&second)?;
+    assert_eq!(graph_delta_count(state.deltas()?), 1);
+    Ok(())
+}
+
+fn graph_delta_count(deltas: QueryResultsDelta<'_>) -> usize {
+    let QueryResultsDelta::Graph(values) = deltas else {
+        unreachable!("expected graph deltas")
+    };
+    values.count()
+}
 
 #[expect(clippy::non_ascii_literal)]
 const GRAPH_DATA: &str = r#"
