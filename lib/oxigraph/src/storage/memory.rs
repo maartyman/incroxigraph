@@ -9,6 +9,7 @@ use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
 use oxstr::OxString;
 use rustc_hash::FxHasher;
+use spareval::BatchedIterator;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -809,6 +810,19 @@ impl Iterator for QuadIterator<'_> {
             }
             return Some(current.quad.clone());
         }
+    }
+}
+
+impl BatchedIterator for QuadIterator<'_> {
+    type Item = EncodedQuad;
+
+    fn next_batch(&mut self, output: &mut Vec<Self::Item>, batch_size: usize) -> usize {
+        let initial_len = output.len();
+        while output.len() - initial_len < batch_size {
+            let Some(quad) = self.next() else { break };
+            output.push(quad);
+        }
+        output.len() - initial_len
     }
 }
 

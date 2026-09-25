@@ -9,8 +9,8 @@ use oxstr::OxString;
 #[cfg(feature = "rdf-12")]
 use spareval::ExpressionTriple;
 use spareval::{
-    Delta, ExpressionTerm, IncrementalQueryNotifier, IncrementalQueryableDataset, InternalQuad,
-    InternalTriple, QueryableDataset, StreamingItem,
+    BatchedIterator, Delta, ExpressionTerm, IncrementalQueryNotifier, IncrementalQueryableDataset,
+    InternalQuad, InternalTriple, QueryableDataset, StreamingItem,
 };
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
@@ -223,16 +223,17 @@ impl<'a> IncrementalQueryableDataset<'a> for DatasetView<'a> {
         object: Option<&EncodedTerm>,
         graph_name: Option<Option<&EncodedTerm>>,
         notifier: Weak<IncrementalQueryNotifier>,
-    ) -> impl Iterator<Item = Result<StreamingItem<Delta<InternalQuad<EncodedTerm>>>, StorageError>>
-    + use<'a> {
-        Box::new(LiveQuadDeltaSource::new(
+    ) -> impl BatchedIterator<
+        Item = Result<StreamingItem<Delta<InternalQuad<EncodedTerm>>>, StorageError>,
+    > + use<'a> {
+        LiveQuadDeltaSource::new(
             Arc::clone(&self.reader),
             subject,
             predicate,
             object,
             graph_name,
             notifier,
-        ))
+        )
     }
 }
 
@@ -241,6 +242,7 @@ struct LiveQuadDeltaSource<'a> {
     snapshot_iter: DecodingQuadIterator<'a>,
     subscription_id: Option<usize>,
     snapshot_done: bool,
+    snapshot_batch: Vec<Result<EncodedQuad, StorageError>>,
     live_buffer: IntoIter<Delta<EncodedQuad>>,
 }
 
@@ -276,6 +278,7 @@ impl<'a> LiveQuadDeltaSource<'a> {
             snapshot_iter,
             subscription_id,
             snapshot_done: false,
+            snapshot_batch: Vec::new(),
             live_buffer: VecDeque::new().into_iter(),
         }
     }
@@ -319,6 +322,43 @@ impl Iterator for LiveQuadDeltaSource<'_> {
         self.next_live_change()
             .map(|change| Ok(StreamingItem::Item(change.map(Self::map_quad))))
             .or_else(|| self.subscription_id.map(|_| Ok(StreamingItem::Pending)))
+    }
+}
+
+impl BatchedIterator for LiveQuadDeltaSource<'_> {
+    type Item = Result<StreamingItem<Delta<InternalQuad<EncodedTerm>>>, StorageError>;
+
+    fn next_batch(&mut self, output: &mut Vec<Self::Item>, batch_size: usize) -> usize {
+        let initial_len = output.len();
+        while output.len() - initial_len < batch_size {
+            if !self.snapshot_done {
+                self.snapshot_batch.clear();
+                let remaining = batch_size - (output.len() - initial_len);
+                if self
+                    .snapshot_iter
+                    .next_batch(&mut self.snapshot_batch, remaining)
+                    == 0
+                {
+                    self.snapshot_done = true;
+                    continue;
+                }
+                output.extend(self.snapshot_batch.drain(..).map(|quad| {
+                    quad.map(Self::map_quad)
+                        .map(Delta::addition)
+                        .map(StreamingItem::Item)
+                }));
+                continue;
+            }
+            if let Some(change) = self.next_live_change() {
+                output.push(Ok(StreamingItem::Item(change.map(Self::map_quad))));
+                continue;
+            }
+            if self.subscription_id.is_some() {
+                output.push(Ok(StreamingItem::Pending));
+            }
+            break;
+        }
+        output.len() - initial_len
     }
 }
 

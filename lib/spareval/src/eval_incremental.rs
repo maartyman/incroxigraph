@@ -4,12 +4,13 @@ use super::{
 };
 #[cfg(feature = "sparql-12")]
 use crate::ExpressionTriple;
+use crate::batch::{BatchedFilterMap, BatchedMap};
 use crate::expression::CustomFunctionRegistry;
 use crate::service::ServiceHandlerRegistry;
 use crate::{
-    CancellationToken, CustomAggregateFunctionRegistry, Delta, DeltaKind,
-    IncrementalQueryableDataset, InternalQuad, QueryDatasetSpecification, QueryEvaluationError,
-    QuerySolution,
+    BatchedIterator, CancellationToken, CustomAggregateFunctionRegistry, Delta, DeltaKind,
+    IncrementalQueryableDataset, InternalQuad, IteratorBatched, QueryDatasetSpecification,
+    QueryEvaluationError, QuerySolution,
 };
 use oxiri::Iri;
 #[cfg(feature = "sparql-12")]
@@ -46,8 +47,15 @@ type InternalTupleDeltaEvaluator<'a, T> =
     Rc<dyn Fn(InternalTuple<T>) -> InternalTupleDeltasIterator<'a, T> + 'a>;
 
 type InternalTupleDeltasIterator<'a, T> = Box<
-    dyn Iterator<Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>> + 'a,
+    dyn BatchedIterator<Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>
+        + 'a,
 >;
+
+const DEFAULT_BATCH_SIZE: usize = 128;
+
+fn is_streaming_boundary<T, E>(item: &Result<StreamingItem<T>, E>) -> bool {
+    matches!(item, Ok(StreamingItem::Pending))
+}
 
 pub type QuerySolutionChange = Delta<QuerySolution>;
 
@@ -158,16 +166,19 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
         object: Option<&D::InternalTerm>,
         graph_name: Option<Option<&D::InternalTerm>>,
         notifier: Weak<IncrementalQueryNotifier>,
-    ) -> impl Iterator<
+    ) -> impl BatchedIterator<
         Item = Result<StreamingItem<Delta<InternalQuad<D::InternalTerm>>>, QueryEvaluationError>,
     > + use<'a, D> {
         let cancellation_token = self.cancellation_token.clone();
-        self.dataset
-            .internal_quad_deltas_for_pattern(subject, predicate, object, graph_name, notifier)
-            .map(move |r| {
+        BatchedMap::new(
+            self.dataset
+                .internal_quad_deltas_for_pattern(subject, predicate, object, graph_name, notifier),
+            move |r: Result<StreamingItem<Delta<InternalQuad<D::InternalTerm>>>, D::Error>| {
                 cancellation_token.ensure_alive()?;
                 r.map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))
-            })
+            },
+            is_streaming_boundary,
+        )
     }
 
     fn internal_quad_deltas_for_pattern(
@@ -178,7 +189,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
         graph_name: Option<Option<&D::InternalTerm>>,
         notifier: Weak<IncrementalQueryNotifier>,
     ) -> Box<
-        dyn Iterator<
+        dyn BatchedIterator<
                 Item = Result<
                     StreamingItem<Delta<InternalQuad<D::InternalTerm>>>,
                     QueryEvaluationError,
@@ -201,29 +212,35 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
                         notifier,
                     ))
                 } else {
-                    Box::new(empty())
+                    Box::new(IteratorBatched::new(empty()))
                 }
             } else if let Some(default_graph_graphs) = &self.specification.default {
                 if default_graph_graphs.len() == 1 {
-                    Box::new(
+                    Box::new(BatchedMap::new(
                         self.underlying_internal_quad_deltas_for_pattern(
                             subject,
                             predicate,
                             object,
                             Some(default_graph_graphs[0].as_ref()),
                             notifier,
-                        )
-                        .map(|quad| {
-                            let quad = quad?;
-                            Ok(match quad {
-                                StreamingItem::Item(mut quad) => {
-                                    quad.value_mut().graph_name = None;
-                                    StreamingItem::Item(quad)
-                                }
-                                StreamingItem::Pending => StreamingItem::Pending,
-                            })
-                        }),
-                    )
+                        ),
+                        |quad: Result<
+                            StreamingItem<Delta<InternalQuad<D::InternalTerm>>>,
+                            QueryEvaluationError,
+                        >| {
+                            (|| {
+                                let quad = quad?;
+                                Ok(match quad {
+                                    StreamingItem::Item(mut quad) => {
+                                        quad.value_mut().graph_name = None;
+                                        StreamingItem::Item(quad)
+                                    }
+                                    StreamingItem::Pending => StreamingItem::Pending,
+                                })
+                            })()
+                        },
+                        is_streaming_boundary,
+                    ))
                 } else {
                     let iters = default_graph_graphs
                         .iter()
@@ -239,8 +256,36 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
                             },
                         )
                         .collect::<Vec<_>>();
-                    Box::new(DeduplicatingDefaultGraphIterator::new(
-                        RoundRobinStreamingIterator::new(iters).map(|quad| {
+                    Box::new(DeduplicatingDefaultGraphIterator::new(BatchedMap::new(
+                        RoundRobinStreamingIterator::new(iters),
+                        |quad: Result<
+                            StreamingItem<Delta<InternalQuad<D::InternalTerm>>>,
+                            QueryEvaluationError,
+                        >| {
+                            (|| {
+                                let quad = quad?;
+                                Ok(match quad {
+                                    StreamingItem::Item(mut quad) => {
+                                        quad.value_mut().graph_name = None;
+                                        StreamingItem::Item(quad)
+                                    }
+                                    StreamingItem::Pending => StreamingItem::Pending,
+                                })
+                            })()
+                        },
+                        is_streaming_boundary,
+                    )))
+                }
+            } else {
+                Box::new(DeduplicatingDefaultGraphIterator::new(BatchedMap::new(
+                    self.underlying_internal_quad_deltas_for_pattern(
+                        subject, predicate, object, None, notifier,
+                    ),
+                    |quad: Result<
+                        StreamingItem<Delta<InternalQuad<D::InternalTerm>>>,
+                        QueryEvaluationError,
+                    >| {
+                        (|| {
                             let quad = quad?;
                             Ok(match quad {
                                 StreamingItem::Item(mut quad) => {
@@ -249,25 +294,10 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
                                 }
                                 StreamingItem::Pending => StreamingItem::Pending,
                             })
-                        }),
-                    ))
-                }
-            } else {
-                Box::new(DeduplicatingDefaultGraphIterator::new(
-                    self.underlying_internal_quad_deltas_for_pattern(
-                        subject, predicate, object, None, notifier,
-                    )
-                    .map(|quad| {
-                        let quad = quad?;
-                        Ok(match quad {
-                            StreamingItem::Item(mut quad) => {
-                                quad.value_mut().graph_name = None;
-                                StreamingItem::Item(quad)
-                            }
-                            StreamingItem::Pending => StreamingItem::Pending,
-                        })
-                    }),
-                ))
+                        })()
+                    },
+                    is_streaming_boundary,
+                )))
             }
         } else if let Some(named_graphs) = &self.specification.named {
             let iters = named_graphs
@@ -286,64 +316,95 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
                 .collect::<Vec<_>>();
             Box::new(RoundRobinStreamingIterator::new(iters))
         } else {
-            Box::new(
+            Box::new(BatchedFilterMap::new(
                 self.underlying_internal_quad_deltas_for_pattern(
                     subject, predicate, object, None, notifier,
-                )
-                .filter(|q| {
-                    !q.as_ref().is_ok_and(|q| {
+                ),
+                |q: Result<
+                    StreamingItem<Delta<InternalQuad<D::InternalTerm>>>,
+                    QueryEvaluationError,
+                >| {
+                    (!q.as_ref().is_ok_and(|q| {
                         matches!(
                             q,
                             StreamingItem::Item(quad_delta)
                                 if quad_delta.value().graph_name.is_none()
                         )
-                    })
-                }),
-            )
+                    }))
+                    .then_some(q)
+                },
+                is_streaming_boundary,
+            ))
         }
     }
 }
 
 type InternalQuadDeltaIterator<'a, T> = Box<
-    dyn Iterator<Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>> + 'a,
+    dyn BatchedIterator<Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>>
+        + 'a,
 >;
 
 /// Polls each live source once per round, so a pending source cannot starve the others.
 struct RoundRobinStreamingIterator<'a, T> {
     iterators: Vec<Option<InternalQuadDeltaIterator<'a, T>>>,
+    inputs: Vec<Vec<Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>>>,
     next: usize,
 }
 
 impl<'a, T> RoundRobinStreamingIterator<'a, T> {
     fn new(iterators: Vec<InternalQuadDeltaIterator<'a, T>>) -> Self {
+        let len = iterators.len();
         Self {
             iterators: iterators.into_iter().map(Some).collect(),
+            inputs: (0..len).map(|_| Vec::new()).collect(),
             next: 0,
         }
     }
 }
 
-impl<T> Iterator for RoundRobinStreamingIterator<'_, T> {
+impl<T> BatchedIterator for RoundRobinStreamingIterator<'_, T> {
     type Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.iterators.is_empty() {
-            return None;
-        }
-        let mut live = false;
-        for _ in 0..self.iterators.len() {
-            let index = self.next;
-            self.next = (self.next + 1) % self.iterators.len();
-            let Some(iterator) = &mut self.iterators[index] else {
-                continue;
-            };
-            match iterator.next() {
-                Some(Ok(StreamingItem::Pending)) => live = true,
-                Some(item) => return Some(item),
-                None => self.iterators[index] = None,
+    fn next_batch(&mut self, output: &mut Vec<Self::Item>, batch_size: usize) -> usize {
+        let initial_len = output.len();
+        while output.len() - initial_len < batch_size {
+            if self.iterators.is_empty() {
+                break;
+            }
+            let mut live = false;
+            let mut result = None;
+            for _ in 0..self.iterators.len() {
+                let index = self.next;
+                self.next = (self.next + 1) % self.iterators.len();
+                let Some(iterator) = &mut self.iterators[index] else {
+                    continue;
+                };
+                if self.inputs[index].is_empty() {
+                    if iterator.next_batch(&mut self.inputs[index], 1) == 0 {
+                        self.iterators[index] = None;
+                        continue;
+                    }
+                    self.inputs[index].reverse();
+                }
+                match self.inputs[index].pop() {
+                    Some(Ok(StreamingItem::Pending)) => live = true,
+                    Some(item) => {
+                        result = Some(item);
+                        break;
+                    }
+                    None => self.iterators[index] = None,
+                }
+            }
+            if let Some(result) = result {
+                output.push(result);
+            } else if live {
+                output.push(Ok(StreamingItem::Pending));
+                break;
+            } else {
+                break;
             }
         }
-        live.then_some(Ok(StreamingItem::Pending))
+        output.len() - initial_len
     }
 }
 
@@ -351,6 +412,7 @@ impl<T> Iterator for RoundRobinStreamingIterator<'_, T> {
 struct DeduplicatingDefaultGraphIterator<I, T> {
     inner: I,
     counts: FxHashMap<InternalQuad<T>, usize>,
+    input: Vec<Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>>,
 }
 
 impl<I, T> DeduplicatingDefaultGraphIterator<I, T> {
@@ -358,43 +420,63 @@ impl<I, T> DeduplicatingDefaultGraphIterator<I, T> {
         Self {
             inner,
             counts: FxHashMap::default(),
+            input: Vec::new(),
         }
     }
 }
 
-impl<I, T> Iterator for DeduplicatingDefaultGraphIterator<I, T>
+impl<I, T> BatchedIterator for DeduplicatingDefaultGraphIterator<I, T>
 where
-    I: Iterator<Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>>,
+    I: BatchedIterator<Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>>,
     T: Clone + Eq + Hash,
 {
     type Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let item = self.inner.next()?;
-            let delta = match item {
-                Ok(StreamingItem::Pending) => return Some(Ok(StreamingItem::Pending)),
-                Err(error) => return Some(Err(error)),
-                Ok(StreamingItem::Item(delta)) => delta,
-            };
-            match delta {
-                Delta::Addition(quad) => {
-                    let count = self.counts.entry(quad.clone()).or_default();
-                    *count += 1;
-                    if *count == 1 {
-                        return Some(Ok(StreamingItem::Item(Delta::Addition(quad))));
-                    }
+    fn next_batch(&mut self, output: &mut Vec<Self::Item>, batch_size: usize) -> usize {
+        let initial_len = output.len();
+        while output.len() - initial_len < batch_size {
+            if self.input.is_empty() {
+                let remaining = batch_size - (output.len() - initial_len);
+                if self.inner.next_batch(&mut self.input, remaining) == 0 {
+                    break;
                 }
-                Delta::Deletion(quad) => match self.counts.get_mut(&quad) {
-                    Some(count) if *count > 1 => *count -= 1,
-                    Some(_) => {
-                        self.counts.remove(&quad);
-                        return Some(Ok(StreamingItem::Item(Delta::Deletion(quad))));
+                self.input.reverse();
+            }
+            while let Some(item) = self.input.pop() {
+                let delta = match item {
+                    Ok(StreamingItem::Pending) => {
+                        output.push(Ok(StreamingItem::Pending));
+                        return output.len() - initial_len;
                     }
-                    None => return Some(Err(non_existing_tuple_deleted())),
-                },
+                    Err(error) => {
+                        output.push(Err(error));
+                        continue;
+                    }
+                    Ok(StreamingItem::Item(delta)) => delta,
+                };
+                match delta {
+                    Delta::Addition(quad) => {
+                        let count = self.counts.entry(quad.clone()).or_default();
+                        *count += 1;
+                        if *count == 1 {
+                            output.push(Ok(StreamingItem::Item(Delta::Addition(quad))));
+                        }
+                    }
+                    Delta::Deletion(quad) => match self.counts.get_mut(&quad) {
+                        Some(count) if *count > 1 => *count -= 1,
+                        Some(_) => {
+                            self.counts.remove(&quad);
+                            output.push(Ok(StreamingItem::Item(Delta::Deletion(quad))));
+                        }
+                        None => output.push(Err(non_existing_tuple_deleted())),
+                    },
+                }
+                if output.len() - initial_len >= batch_size {
+                    break;
+                }
             }
         }
+        output.len() - initial_len
     }
 }
 
@@ -417,6 +499,7 @@ pub struct IncrementalSelectDriver<'a, D: IncrementalQueryableDataset<'a>> {
     core: IncrementalDriverCore<'a, D>,
     variables: Arc<[Variable]>,
     iter: InternalTupleDeltasIterator<'a, D::InternalTerm>,
+    input: Vec<Result<StreamingItem<Delta<InternalTuple<D::InternalTerm>>>, QueryEvaluationError>>,
 }
 
 pub struct SimpleIncrementalEvaluator<'a, D: IncrementalQueryableDataset<'a>> {
@@ -490,6 +573,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                 },
                 variables: Arc::from(variables),
                 iter: eval(from),
+                input: Vec::with_capacity(DEFAULT_BATCH_SIZE),
             }),
             stats,
         )
@@ -577,14 +661,14 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                     })
                     .collect::<Result<Vec<_>, QueryEvaluationError>>()?;
                 Rc::new(move |from| {
-                    Box::new(
+                    Box::new(IteratorBatched::new(
                         encoded_tuples
                             .iter()
                             .filter_map(move |t| from.combine_with(t))
                             .map(|tuple| Ok(StreamingItem::Item(Delta::addition(tuple))))
                             .collect::<Vec<_>>()
                             .into_iter(),
-                    )
+                    ))
                 })
             }
             QueryExpression::QuadPattern {
@@ -620,7 +704,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         &dataset,
                     ) {
                         Ok(value) => value,
-                        Err(e) => return Box::new(once(Err(e))),
+                        Err(e) => return Box::new(IteratorBatched::new(once(Err(e)))),
                     };
                     let input_predicate = match predicate_selector.get_pattern_value(
                         &from,
@@ -628,7 +712,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         &dataset,
                     ) {
                         Ok(value) => value,
-                        Err(e) => return Box::new(once(Err(e))),
+                        Err(e) => return Box::new(IteratorBatched::new(once(Err(e)))),
                     };
                     let input_object = match object_selector.get_pattern_value(
                         &from,
@@ -636,7 +720,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         &dataset,
                     ) {
                         Ok(value) => value,
-                        Err(e) => return Box::new(once(Err(e))),
+                        Err(e) => return Box::new(IteratorBatched::new(once(Err(e)))),
                     };
                     let input_graph_name = if let Some(graph_name_selector) = &graph_name_selector {
                         match graph_name_selector.get_pattern_value(
@@ -645,7 +729,7 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                             &dataset,
                         ) {
                             Ok(value) => value,
-                            Err(e) => return Box::new(once(Err(e))),
+                            Err(e) => return Box::new(IteratorBatched::new(once(Err(e)))),
                         }
                         .map(Some)
                     } else {
@@ -664,58 +748,70 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                     let graph_name_selector = graph_name_selector.clone();
                     #[cfg(feature = "sparql-12")]
                     let dataset = dataset.clone();
-                    Box::new(
-                        iter.map(move |quad| match quad? {
-                            StreamingItem::Pending => Ok(Some(StreamingItem::Pending)),
-                            StreamingItem::Item(quad) => {
-                                let (kind, quad) = quad.into_parts();
-                                let mut new_tuple = from.clone();
-                                if !put_pattern_value::<D>(
-                                    &subject_selector,
-                                    quad.subject,
-                                    &mut new_tuple,
-                                    #[cfg(feature = "sparql-12")]
-                                    &dataset,
-                                )? {
-                                    return Ok(None);
-                                }
-                                if !put_pattern_value::<D>(
-                                    &predicate_selector,
-                                    quad.predicate,
-                                    &mut new_tuple,
-                                    #[cfg(feature = "sparql-12")]
-                                    &dataset,
-                                )? {
-                                    return Ok(None);
-                                }
-                                if !put_pattern_value::<D>(
-                                    &object_selector,
-                                    quad.object,
-                                    &mut new_tuple,
-                                    #[cfg(feature = "sparql-12")]
-                                    &dataset,
-                                )? {
-                                    return Ok(None);
-                                }
-                                if let Some(graph_name_selector) = &graph_name_selector {
-                                    let Some(quad_graph_name) = quad.graph_name else {
-                                        return Err(QueryEvaluationError::UnexpectedDefaultGraph);
-                                    };
+                    Box::new(BatchedFilterMap::new(
+                        iter,
+                        move |quad: Result<
+                            StreamingItem<Delta<InternalQuad<D::InternalTerm>>>,
+                            QueryEvaluationError,
+                        >| {
+                            let result: Result<
+                                Option<StreamingItem<Delta<InternalTuple<D::InternalTerm>>>>,
+                                QueryEvaluationError,
+                            > = (|| match quad? {
+                                StreamingItem::Pending => Ok(Some(StreamingItem::Pending)),
+                                StreamingItem::Item(quad) => {
+                                    let (kind, quad) = quad.into_parts();
+                                    let mut new_tuple = from.clone();
                                     if !put_pattern_value::<D>(
-                                        graph_name_selector,
-                                        quad_graph_name,
+                                        &subject_selector,
+                                        quad.subject,
                                         &mut new_tuple,
                                         #[cfg(feature = "sparql-12")]
                                         &dataset,
                                     )? {
                                         return Ok(None);
                                     }
+                                    if !put_pattern_value::<D>(
+                                        &predicate_selector,
+                                        quad.predicate,
+                                        &mut new_tuple,
+                                        #[cfg(feature = "sparql-12")]
+                                        &dataset,
+                                    )? {
+                                        return Ok(None);
+                                    }
+                                    if !put_pattern_value::<D>(
+                                        &object_selector,
+                                        quad.object,
+                                        &mut new_tuple,
+                                        #[cfg(feature = "sparql-12")]
+                                        &dataset,
+                                    )? {
+                                        return Ok(None);
+                                    }
+                                    if let Some(graph_name_selector) = &graph_name_selector {
+                                        let Some(quad_graph_name) = quad.graph_name else {
+                                            return Err(
+                                                QueryEvaluationError::UnexpectedDefaultGraph,
+                                            );
+                                        };
+                                        if !put_pattern_value::<D>(
+                                            graph_name_selector,
+                                            quad_graph_name,
+                                            &mut new_tuple,
+                                            #[cfg(feature = "sparql-12")]
+                                            &dataset,
+                                        )? {
+                                            return Ok(None);
+                                        }
+                                    }
+                                    Ok(Some(StreamingItem::Item(Delta::with_kind(kind, new_tuple))))
                                 }
-                                Ok(Some(StreamingItem::Item(Delta::with_kind(kind, new_tuple))))
-                            }
-                        })
-                        .filter_map(Result::transpose),
-                    )
+                            })();
+                            result.transpose()
+                        },
+                        is_streaming_boundary,
+                    ))
                 })
             }
             QueryExpression::Path { .. } => {
@@ -742,6 +838,8 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                                 Box::new(SymmetricNestedLoopJoinIterator {
                                     left_iter: left(from.clone()),
                                     right_iter: right(from),
+                                    left_input: Vec::with_capacity(DEFAULT_BATCH_SIZE),
+                                    right_input: Vec::with_capacity(DEFAULT_BATCH_SIZE),
                                     left_values: Vec::new(),
                                     right_values: Vec::new(),
                                     buffered_results: Vec::new(),
@@ -765,10 +863,10 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                                 Box::new(SymmetricHashJoinIterator {
                                     left_iter,
                                     right_iter,
+                                    left_input: Vec::with_capacity(DEFAULT_BATCH_SIZE),
+                                    right_input: Vec::with_capacity(DEFAULT_BATCH_SIZE),
                                     left_values,
                                     right_values,
-                                    pending_values: Vec::new(),
-                                    buffered_results: Vec::new(),
                                     left_done: false,
                                     right_done: false,
                                     active_side: JoinSide::Left,
@@ -831,32 +929,40 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         }
                     }
                     input_tuple.graph_name.clone_from(&from.graph_name);
-                    Box::new(child(input_tuple).filter_map(move |change| {
-                        match change {
-                            Ok(StreamingItem::Item(delta)) => {
-                                let (kind, tuple) = delta.into_parts();
-                                let mut output_tuple = from.clone();
-                                for (input_key, output_key) in &*mapping {
-                                    if let Some(value) = tuple.get(*input_key) {
-                                        if let Some(existing_value) = output_tuple.get(*output_key)
-                                        {
-                                            if existing_value != value {
-                                                return None; // Conflict
+                    Box::new(BatchedFilterMap::new(
+                        child(input_tuple),
+                        move |change: Result<
+                            StreamingItem<Delta<InternalTuple<D::InternalTerm>>>,
+                            QueryEvaluationError,
+                        >| {
+                            match change {
+                                Ok(StreamingItem::Item(delta)) => {
+                                    let (kind, tuple) = delta.into_parts();
+                                    let mut output_tuple = from.clone();
+                                    for (input_key, output_key) in &*mapping {
+                                        if let Some(value) = tuple.get(*input_key) {
+                                            if let Some(existing_value) =
+                                                output_tuple.get(*output_key)
+                                            {
+                                                if existing_value != value {
+                                                    return None; // Conflict
+                                                }
+                                            } else {
+                                                output_tuple.set(*output_key, value.clone());
                                             }
-                                        } else {
-                                            output_tuple.set(*output_key, value.clone());
                                         }
                                     }
+                                    Some(Ok(StreamingItem::Item(Delta::with_kind(
+                                        kind,
+                                        output_tuple,
+                                    ))))
                                 }
-                                Some(Ok(StreamingItem::Item(Delta::with_kind(
-                                    kind,
-                                    output_tuple,
-                                ))))
+                                Ok(StreamingItem::Pending) => Some(Ok(StreamingItem::Pending)),
+                                Err(error) => Some(Err(error)),
                             }
-                            Ok(StreamingItem::Pending) => Some(Ok(StreamingItem::Pending)),
-                            Err(error) => Some(Err(error)),
-                        }
-                    }))
+                        },
+                        is_streaming_boundary,
+                    ))
                 })
             }
             QueryExpression::Group { .. } => {
@@ -922,7 +1028,11 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectDriver<'a, D> {
     pub fn poll_next(
         &mut self,
     ) -> Result<IncrementalDriverState<QuerySolutionChange>, QueryEvaluationError> {
-        match self.iter.next() {
+        if self.input.is_empty() {
+            self.iter.next_batch(&mut self.input, DEFAULT_BATCH_SIZE);
+            self.input.reverse();
+        }
+        match self.input.pop() {
             Some(Ok(StreamingItem::Item(delta))) => {
                 let (kind, tuple) = delta.into_parts();
                 let mut result = vec![None; self.variables.len()];
@@ -970,62 +1080,61 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectDriver<'a, D> {
 struct SymmetricHashJoinIterator<'a, T> {
     left_iter: InternalTupleDeltasIterator<'a, T>,
     right_iter: InternalTupleDeltasIterator<'a, T>,
+    left_input: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
+    right_input: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
     left_values: InternalTupleSet<T>,
     right_values: InternalTupleSet<T>,
-    pending_values: Vec<(u64, Delta<InternalTuple<T>>)>,
-    buffered_results: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
     left_done: bool,
     right_done: bool,
     active_side: JoinSide,
 }
 
-impl<T: Clone + Eq + Hash> Iterator for SymmetricHashJoinIterator<'_, T> {
+impl<T: Clone + Eq + Hash> BatchedIterator for SymmetricHashJoinIterator<'_, T> {
     type Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
-            }
+    fn next_batch(&mut self, output: &mut Vec<Self::Item>, batch_size: usize) -> usize {
+        let initial_len = output.len();
+        while output.len() < batch_size {
             if self.left_done && self.right_done {
-                return None;
+                break;
             }
 
-            let first_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
-            }
-
+            let first_state = self.poll_active_side(output, batch_size);
             self.active_side = self.active_side.other();
-            let second_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
-            }
+            let second_state = self.poll_active_side(output, batch_size);
 
             if self.left_done && self.right_done {
-                return None;
+                break;
             }
             if matches!(first_state, PollState::Pending | PollState::Done)
                 && matches!(second_state, PollState::Pending | PollState::Done)
             {
-                return Some(Ok(StreamingItem::Pending));
+                output.push(Ok(StreamingItem::Pending));
+                break;
             }
         }
+        output.len() - initial_len
     }
 }
 
 impl<T: Clone + Eq + Hash> SymmetricHashJoinIterator<'_, T> {
-    fn poll_active_side(&mut self) -> PollState {
-        let (iter, values, other_values, done) = match self.active_side {
+    fn poll_active_side(
+        &mut self,
+        output: &mut Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
+        batch_size: usize,
+    ) -> PollState {
+        let (iter, values, input, other_values, done) = match self.active_side {
             JoinSide::Left => (
                 &mut self.left_iter,
                 &mut self.left_values,
+                &mut self.left_input,
                 &self.right_values,
                 &mut self.left_done,
             ),
             JoinSide::Right => (
                 &mut self.right_iter,
                 &mut self.right_values,
+                &mut self.right_input,
                 &self.left_values,
                 &mut self.right_done,
             ),
@@ -1034,54 +1143,78 @@ impl<T: Clone + Eq + Hash> SymmetricHashJoinIterator<'_, T> {
             return PollState::Done;
         }
 
-        while self.buffered_results.is_empty() {
-            match iter.next() {
-                Some(Ok(StreamingItem::Item(delta))) => {
-                    let key = other_values.tuple_key(delta.value());
-                    let kind = delta.kind();
-                    self.buffered_results.extend(
-                        other_values
-                            .get(key)
-                            .iter()
-                            .filter_map(|other| delta.value().combine_with(other))
-                            .map(move |joined| {
-                                Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
-                            }),
-                    );
-                    self.pending_values.push((key, delta));
-                }
-                Some(Ok(StreamingItem::Pending)) => break,
-                Some(Err(error)) => {
-                    self.buffered_results.push(Err(error));
+        let output_start = output.len();
+        let mut pending_values = Vec::new();
+        let mut made_progress = false;
+        while output.len() < batch_size {
+            if input.is_empty() && iter.next_batch(input, batch_size - output.len()) == 0 {
+                *done = true;
+                break;
+            }
+
+            let keys = input
+                .iter()
+                .take_while(|item| matches!(item, Ok(StreamingItem::Item(_))))
+                .map(|item| match item {
+                    Ok(StreamingItem::Item(delta)) => other_values.tuple_key(delta.value()),
+                    _ => unreachable!("the delta prefix contains only tuple deltas"),
+                })
+                .collect::<Vec<_>>();
+            let delta_count = keys.len();
+            output.reserve(keys.iter().map(|key| other_values.get(*key).len()).sum());
+            pending_values.reserve(delta_count);
+            for (key, item) in keys.into_iter().zip(input.drain(..delta_count)) {
+                let Ok(StreamingItem::Item(delta)) = item else {
+                    unreachable!("the delta prefix contains only tuple deltas");
+                };
+                let kind = delta.kind();
+                output.extend(
+                    other_values
+                        .get(key)
+                        .iter()
+                        .filter_map(|other| delta.value().combine_with(other))
+                        .map(move |joined| Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))),
+                );
+                pending_values.push((key, delta));
+            }
+            made_progress |= delta_count != 0;
+
+            if input.is_empty() {
+                continue;
+            }
+            let boundary = input
+                .drain(..1)
+                .next()
+                .expect("the input buffer is non-empty");
+            match boundary {
+                Ok(StreamingItem::Pending) => break,
+                Err(error) => {
+                    output.push(Err(error));
                     break;
                 }
-                None => {
-                    *done = true;
-                    break;
+                Ok(StreamingItem::Item(_)) => {
+                    unreachable!("all leading tuple deltas were consumed");
                 }
             }
         }
 
-        values.reserve(self.pending_values.len());
-        for (key, delta) in self.pending_values.drain(..) {
+        values.reserve(pending_values.len());
+        for (key, delta) in pending_values {
             match delta {
                 Delta::Addition(tuple) => values.insert(key, tuple),
                 Delta::Deletion(tuple) if !values.remove_one(key, &tuple) => {
-                    self.buffered_results
-                        .push(Err(non_existing_tuple_deleted()));
+                    output.push(Err(non_existing_tuple_deleted()));
                 }
                 Delta::Deletion(_) => {}
             }
         }
 
-        if self.buffered_results.is_empty() {
-            if *done {
-                PollState::Done
-            } else {
-                PollState::Pending
-            }
-        } else {
+        if made_progress || output.len() != output_start {
             PollState::Item
+        } else if *done {
+            PollState::Done
+        } else {
+            PollState::Pending
         }
     }
 }
@@ -1104,6 +1237,8 @@ impl JoinSide {
 struct SymmetricNestedLoopJoinIterator<'a, T> {
     left_iter: InternalTupleDeltasIterator<'a, T>,
     right_iter: InternalTupleDeltasIterator<'a, T>,
+    left_input: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
+    right_input: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
     left_values: Vec<InternalTuple<T>>,
     right_values: Vec<InternalTuple<T>>,
     buffered_results: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
@@ -1115,15 +1250,17 @@ struct SymmetricNestedLoopJoinIterator<'a, T> {
 impl<T: Clone + Eq> SymmetricNestedLoopJoinIterator<'_, T> {
     fn poll_active_side(&mut self) -> PollState {
         let active_side = self.active_side;
-        let (iter, values, other_values, done) = match active_side {
+        let (iter, input, values, other_values, done) = match active_side {
             JoinSide::Left => (
                 &mut self.left_iter,
+                &mut self.left_input,
                 &mut self.left_values,
                 &self.right_values,
                 &mut self.left_done,
             ),
             JoinSide::Right => (
                 &mut self.right_iter,
+                &mut self.right_input,
                 &mut self.right_values,
                 &self.left_values,
                 &mut self.right_done,
@@ -1133,92 +1270,89 @@ impl<T: Clone + Eq> SymmetricNestedLoopJoinIterator<'_, T> {
             return PollState::Done;
         }
 
-        while self.buffered_results.is_empty() {
-            match iter.next() {
-                Some(Ok(StreamingItem::Item(delta))) => {
-                    let (kind, tuple) = delta.into_parts();
-                    let joined = |other: &InternalTuple<T>| match active_side {
-                        JoinSide::Left => tuple.combine_with(other),
-                        JoinSide::Right => other.combine_with(&tuple),
-                    };
-                    match kind {
-                        DeltaKind::Addition => {
+        if input.is_empty() {
+            iter.next_batch(input, DEFAULT_BATCH_SIZE);
+            input.reverse();
+        }
+        match input.pop() {
+            Some(Ok(StreamingItem::Item(delta))) => {
+                let (kind, tuple) = delta.into_parts();
+                let joined = |other: &InternalTuple<T>| match active_side {
+                    JoinSide::Left => tuple.combine_with(other),
+                    JoinSide::Right => other.combine_with(&tuple),
+                };
+                match kind {
+                    DeltaKind::Addition => {
+                        self.buffered_results
+                            .extend(other_values.iter().filter_map(joined).map(move |joined| {
+                                Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
+                            }));
+                        values.push(tuple);
+                    }
+                    DeltaKind::Deletion => {
+                        if let Some(position) = values.iter().position(|value| value == &tuple) {
+                            values.swap_remove(position);
                             self.buffered_results.extend(
                                 other_values.iter().filter_map(joined).map(move |joined| {
                                     Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
                                 }),
                             );
-                            values.push(tuple);
-                        }
-                        DeltaKind::Deletion => {
-                            if let Some(position) = values.iter().position(|value| value == &tuple)
-                            {
-                                values.swap_remove(position);
-                                self.buffered_results.extend(
-                                    other_values.iter().filter_map(joined).map(move |joined| {
-                                        Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
-                                    }),
-                                );
-                            }
                         }
                     }
                 }
-                Some(Ok(StreamingItem::Pending)) => break,
-                Some(Err(error)) => {
-                    self.buffered_results.push(Err(error));
-                    break;
-                }
-                None => {
-                    *done = true;
-                    break;
-                }
+                PollState::Item
             }
-        }
-
-        if self.buffered_results.is_empty() {
-            if *done {
+            Some(Ok(StreamingItem::Pending)) => PollState::Pending,
+            Some(Err(error)) => {
+                self.buffered_results.push(Err(error));
+                PollState::Item
+            }
+            None => {
+                *done = true;
                 PollState::Done
-            } else {
-                PollState::Pending
             }
-        } else {
-            PollState::Item
         }
     }
 }
 
-impl<T: Clone + Eq> Iterator for SymmetricNestedLoopJoinIterator<'_, T> {
+impl<T: Clone + Eq> BatchedIterator for SymmetricNestedLoopJoinIterator<'_, T> {
     type Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_batch(&mut self, output: &mut Vec<Self::Item>, batch_size: usize) -> usize {
+        let initial_len = output.len();
         loop {
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
+            while output.len() - initial_len < batch_size {
+                let Some(result) = self.buffered_results.pop() else {
+                    break;
+                };
+                output.push(result);
             }
-            if self.left_done && self.right_done {
-                return None;
+            if output.len() - initial_len >= batch_size || (self.left_done && self.right_done) {
+                break;
             }
 
             let first_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
+            if !self.buffered_results.is_empty() {
+                continue;
             }
 
             self.active_side = self.active_side.other();
             let second_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
+            if !self.buffered_results.is_empty() {
+                continue;
             }
 
             if self.left_done && self.right_done {
-                return None;
+                break;
             }
             if matches!(first_state, PollState::Pending | PollState::Done)
                 && matches!(second_state, PollState::Pending | PollState::Done)
             {
-                return Some(Ok(StreamingItem::Pending));
+                output.push(Ok(StreamingItem::Pending));
+                break;
             }
         }
+        output.len() - initial_len
     }
 }
 
@@ -1290,23 +1424,29 @@ struct StatsDeltaIterator<'a, T> {
     stats: Rc<EvalNodeWithStats>,
 }
 
-impl<T> Iterator for StatsDeltaIterator<'_, T> {
+impl<T> BatchedIterator for StatsDeltaIterator<'_, T> {
     type Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_batch(&mut self, output: &mut Vec<Self::Item>, batch_size: usize) -> usize {
+        let initial_len = output.len();
         let start = Timer::now();
-        let result = self.inner.next();
-        let duration = start.elapsed()?;
-        self.stats.exec_duration.set(
-            self.stats
-                .exec_duration
-                .get()
-                .and_then(|d| d.checked_add(duration)),
-        );
-        if let Some(Ok(StreamingItem::Item(_))) = &result {
-            self.stats.exec_count.set(self.stats.exec_count.get() + 1);
+        let count = self.inner.next_batch(output, batch_size);
+        if let Some(duration) = start.elapsed() {
+            self.stats.exec_duration.set(
+                self.stats
+                    .exec_duration
+                    .get()
+                    .and_then(|d| d.checked_add(duration)),
+            );
         }
-        result
+        self.stats.exec_count.set(
+            self.stats.exec_count.get()
+                + output[initial_len..]
+                    .iter()
+                    .filter(|result| matches!(result, Ok(StreamingItem::Item(_))))
+                    .count(),
+        );
+        count
     }
 }
 

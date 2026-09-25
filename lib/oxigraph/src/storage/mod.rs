@@ -15,7 +15,7 @@ use crate::storage::rocksdb::{
 };
 use oxstr::OxString;
 use rustc_hash::{FxBuildHasher, FxHashSet};
-use spareval::{Delta, IncrementalQueryNotifier};
+use spareval::{BatchedIterator, Delta, IncrementalQueryNotifier};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::take;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
@@ -480,6 +480,7 @@ impl<'a> StorageReader<'a> {
         graph_name: Option<&EncodedTerm>,
     ) -> DecodingQuadIterator<'a> {
         DecodingQuadIterator {
+            memory_batch: Vec::new(),
             kind: match &self.kind {
                 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
                 StorageReaderKind::RocksDb(reader) => DecodingQuadIteratorKind::RocksDb(
@@ -652,6 +653,7 @@ fn hash_deduplicate<T: Eq + std::hash::Hash + Clone, E>(
 #[must_use]
 pub struct DecodingQuadIterator<'a> {
     kind: DecodingQuadIteratorKind<'a>,
+    memory_batch: Vec<EncodedQuad>,
 }
 
 enum DecodingQuadIteratorKind<'a> {
@@ -669,6 +671,27 @@ impl Iterator for DecodingQuadIterator<'_> {
             DecodingQuadIteratorKind::RocksDb(iter) => iter.next(),
             DecodingQuadIteratorKind::Memory(iter) => iter.next().map(Ok),
         }
+    }
+}
+
+impl BatchedIterator for DecodingQuadIterator<'_> {
+    type Item = Result<EncodedQuad, StorageError>;
+
+    fn next_batch(&mut self, output: &mut Vec<Self::Item>, batch_size: usize) -> usize {
+        let initial_len = output.len();
+        match &mut self.kind {
+            #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+            DecodingQuadIteratorKind::RocksDb(iter) => {
+                output.extend(iter.by_ref().take(batch_size));
+            }
+            DecodingQuadIteratorKind::Memory(iter) => {
+                self.memory_batch.clear();
+                self.memory_batch.reserve(batch_size);
+                iter.next_batch(&mut self.memory_batch, batch_size);
+                output.extend(self.memory_batch.drain(..).map(Ok));
+            }
+        }
+        output.len() - initial_len
     }
 }
 

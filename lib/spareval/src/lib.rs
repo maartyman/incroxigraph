@@ -4,6 +4,7 @@
 #![doc(html_favicon_url = "https://raw.githubusercontent.com/oxigraph/oxigraph/main/logo.svg")]
 #![doc(html_logo_url = "https://raw.githubusercontent.com/oxigraph/oxigraph/main/logo.svg")]
 
+mod batch;
 mod dataset;
 mod delta_model;
 mod error;
@@ -13,6 +14,7 @@ mod model;
 mod service;
 mod update;
 
+pub use crate::batch::{BatchedIterator, IteratorBatched};
 #[cfg(feature = "sparql-12")]
 pub use crate::dataset::ExpressionTriple;
 pub use crate::dataset::{

@@ -1,5 +1,5 @@
-use crate::Delta;
 use crate::eval::{IncrementalQueryNotifier, StreamingItem};
+use crate::{BatchedIterator, Delta, IteratorBatched};
 #[cfg(feature = "sparql-12")]
 use oxrdf::BaseDirection;
 use oxrdf::{
@@ -162,12 +162,14 @@ pub trait IncrementalQueryableDataset<'a>: QueryableDataset<'a> {
         object: Option<&Self::InternalTerm>,
         graph_name: Option<Option<&Self::InternalTerm>>,
         notifier: Weak<IncrementalQueryNotifier>,
-    ) -> impl Iterator<
+    ) -> impl BatchedIterator<
         Item = Result<StreamingItem<Delta<InternalQuad<Self::InternalTerm>>>, Self::Error>,
     > + use<'a, Self> {
         drop(notifier);
-        self.internal_quads_for_pattern(subject, predicate, object, graph_name)
-            .map(|quad| quad.map(Delta::addition).map(StreamingItem::Item))
+        IteratorBatched::new(
+            self.internal_quads_for_pattern(subject, predicate, object, graph_name)
+                .map(|quad| quad.map(Delta::addition).map(StreamingItem::Item)),
+        )
     }
 }
 
