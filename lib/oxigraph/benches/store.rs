@@ -2,17 +2,20 @@
 
 use bzip2::read::MultiBzDecoder;
 use codspeed_criterion_compat::{Criterion, Throughput, criterion_group, criterion_main};
+use flate2::read::GzDecoder;
 use oxhttp::model::{Request, Uri};
 use oxigraph::io::{JsonLdProfile, JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
+use oxigraph::model::Dataset;
+use oxigraph::sparql::{QueryEvaluationError, QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
+use spareval::QueryEvaluator;
 use spargebra::{Query, Update};
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{fs, str};
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 
 fn parse_bsbm(c: &mut Criterion) {
     let data = read_bz2_data("https://zenodo.org/records/12663333/files/dataset-1000.nt.bz2");
@@ -167,6 +170,13 @@ fn do_store_query_and_update(c: &mut Criterion, data_size: usize, without_ops: b
         .filter(|o| matches!(o, Operation::Query(_)))
         .cloned()
         .collect::<Vec<_>>();
+    let explore_select_operations: Vec<_> = explore_query_operations
+        .iter()
+        .filter_map(|o| match o {
+            Operation::Query(q @ Query::Select(_)) => Some(Operation::Query(q.clone())),
+            Operation::Query(_) | Operation::Update(_) => None,
+        })
+        .collect();
     let business_operations = bsbm_sparql_operation("businessIntelligence-1000.csv.bz2")
         .into_iter()
         .map(|op| match op {
@@ -183,9 +193,35 @@ fn do_store_query_and_update(c: &mut Criterion, data_size: usize, without_ops: b
     {
         let memory_store = Store::new().unwrap();
         do_bulk_load(&memory_store, &data);
+        let incremental_dataset = Dataset::from_iter(memory_store.iter().map(|quad| quad.unwrap()));
         group.bench_function(format!("BSBM explore {data_size} query in memory"), |b| {
             b.iter(|| run_operations(&memory_store, &explore_query_operations, true))
         });
+        if !explore_select_operations.is_empty() {
+            group.bench_function(
+                format!("BSBM explore {data_size} SELECT query in memory with incremental engine"),
+                |b| {
+                    b.iter(|| {
+                        run_operations_incremental(
+                            &incremental_dataset,
+                            &explore_select_operations,
+                            true,
+                            UnsupportedQueryHandling::Skip,
+                        )
+                    })
+                },
+            );
+            if without_ops {
+                group.bench_function(
+                    format!(
+                        "BSBM explore {data_size} SELECT query in memory with incremental engine without optimizations"
+                    ),
+                    |b| {
+                        b.iter(|| run_operations_incremental(&incremental_dataset, &explore_select_operations, false, UnsupportedQueryHandling::Skip))
+                    },
+                );
+            }
+        }
         if without_ops {
             group.bench_function(
                 format!("BSBM explore {data_size} query in memory without optimizations"),
@@ -218,9 +254,35 @@ fn do_store_query_and_update(c: &mut Criterion, data_size: usize, without_ops: b
         let path = TempDir::new().unwrap();
         let disk_store = Store::open(&path).unwrap();
         do_bulk_load(&disk_store, &data);
+        let incremental_dataset = Dataset::from_iter(disk_store.iter().map(|quad| quad.unwrap()));
         group.bench_function(format!("BSBM explore {data_size} query on disk"), |b| {
             b.iter(|| run_operations(&disk_store, &explore_query_operations, true))
         });
+        if !explore_select_operations.is_empty() {
+            group.bench_function(
+                format!("BSBM explore {data_size} SELECT query on disk with incremental engine"),
+                |b| {
+                    b.iter(|| {
+                        run_operations_incremental(
+                            &incremental_dataset,
+                            &explore_select_operations,
+                            true,
+                            UnsupportedQueryHandling::Skip,
+                        )
+                    })
+                },
+            );
+            if without_ops {
+                group.bench_function(
+                    format!(
+                        "BSBM explore {data_size} SELECT query on disk with incremental engine without optimizations"
+                    ),
+                    |b| {
+                        b.iter(|| run_operations_incremental(&incremental_dataset, &explore_select_operations, false, UnsupportedQueryHandling::Skip))
+                    },
+                );
+            }
+        }
         if without_ops {
             group.bench_function(
                 format!("BSBM explore {data_size} query on disk without optimizations"),
@@ -242,6 +304,159 @@ fn do_store_query_and_update(c: &mut Criterion, data_size: usize, without_ops: b
             );
         }
     }
+}
+
+fn store_watdiv(c: &mut Criterion) {
+    let scale = std::env::var("WATDIV_STORE_SCALE")
+        .ok()
+        .map(|scale| {
+            scale
+                .parse::<usize>()
+                .expect("WATDIV_STORE_SCALE must be an integer")
+        })
+        .unwrap_or(100);
+    let data_path = std::env::var_os("WATDIV_STORE_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            repo_root()
+                .join("target/watdiv/dataset")
+                .join(format!("watdiv.{scale}.nt"))
+        });
+    let workloads_root = std::env::var_os("WATDIV_STORE_WORKLOAD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("target/watdiv/workloads"));
+    ensure_watdiv_data(&data_path, scale);
+    let stress_dir = workloads_root.join(format!("watdiv-stress-{scale}"));
+    ensure_watdiv_stress_queries(&stress_dir, scale);
+    let stress_queries = watdiv_sparql_queries(
+        &stress_dir,
+        &["test.1", "test.2", "test.3", "test.4", "test.5"],
+    );
+
+    let mut group = c.benchmark_group("store WatDiv operations in memory");
+    group.sample_size(10);
+
+    let memory_store = Store::new().unwrap();
+    let data = fs::read(&data_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read static WatDiv data {}: {error}",
+            data_path.display()
+        )
+    });
+    do_bulk_load(&memory_store, &data);
+    let incremental_dataset = Dataset::from_iter(memory_store.iter().map(|quad| quad.unwrap()));
+    group.bench_function(format!("WatDiv stress {scale} in memory"), |b| {
+        b.iter(|| run_operations(&memory_store, &stress_queries, true))
+    });
+    group.bench_function(
+        format!("WatDiv stress {scale} in memory with incremental engine"),
+        |b| {
+            b.iter(|| {
+                run_operations_incremental(
+                    &incremental_dataset,
+                    &stress_queries,
+                    true,
+                    UnsupportedQueryHandling::Panic,
+                )
+            })
+        },
+    );
+}
+
+fn watdiv_download_dir() -> PathBuf {
+    repo_root().join("target/watdiv/downloads")
+}
+
+fn download_watdiv_archive(url: &str) -> PathBuf {
+    let directory = watdiv_download_dir();
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(url.rsplit('/').next().unwrap());
+    if !path.exists() {
+        let client = oxhttp::Client::new()
+            .with_redirection_limit(5)
+            .with_user_agent(concat!("Oxigraph/", env!("CARGO_PKG_VERSION")))
+            .unwrap();
+        let request = Request::builder().uri(url).body(()).unwrap();
+        let response = client.request(request).unwrap();
+        assert!(
+            response.status().is_success(),
+            "{url} returned {}",
+            response.status()
+        );
+        let mut temp = NamedTempFile::new_in(&directory).unwrap();
+        std::io::copy(&mut response.into_body(), &mut temp).unwrap();
+        temp.persist(&path).unwrap();
+    }
+    path
+}
+
+fn ensure_watdiv_data(path: &Path, scale: usize) {
+    if path.exists() {
+        return;
+    }
+    let size = match scale {
+        100 => "10M",
+        1000 => "100M",
+        _ => panic!(
+            "No official pre-generated WatDiv dataset for scale {scale}; provide WATDIV_STORE_DATA or use scale 100/1000"
+        ),
+    };
+    let url = format!("https://dsg.uwaterloo.ca/watdiv/watdiv.{size}.tar.bz2");
+    let archive_path = download_watdiv_archive(&url);
+    let mut archive = tar::Archive::new(MultiBzDecoder::new(File::open(archive_path).unwrap()));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut output = NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+    let expected = format!("watdiv.{size}.nt");
+    let mut found = false;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap() == Path::new(&expected) {
+            std::io::copy(&mut entry, &mut output).unwrap();
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "{url} does not contain {expected}");
+    output.persist(path).unwrap();
+}
+
+fn ensure_watdiv_stress_queries(directory: &Path, scale: usize) {
+    let names = ["test.1", "test.2", "test.3", "test.4", "test.5"];
+    if names
+        .iter()
+        .all(|name| directory.join(format!("{name}.sparql")).exists())
+    {
+        return;
+    }
+    assert!(
+        scale == 100 || scale == 1000,
+        "No official pre-generated WatDiv stress queries for scale {scale}; provide WATDIV_STORE_WORKLOAD_DIR or use scale 100/1000"
+    );
+    let url = "https://dsg.uwaterloo.ca/watdiv/stress-workloads.tar.gz";
+    let archive_path = download_watdiv_archive(url);
+    let mut archive = tar::Archive::new(GzDecoder::new(File::open(archive_path).unwrap()));
+    fs::create_dir_all(directory).unwrap();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap();
+        if path.parent() != Some(Path::new(directory.file_name().unwrap()))
+            || path
+                .extension()
+                .is_none_or(|extension| extension != "sparql")
+        {
+            continue;
+        }
+        let target = directory.join(path.file_name().unwrap());
+        let mut output = NamedTempFile::new_in(directory).unwrap();
+        std::io::copy(&mut entry, &mut output).unwrap();
+        output.persist(target).unwrap();
+    }
+    assert!(
+        names
+            .iter()
+            .all(|name| directory.join(format!("{name}.sparql")).exists()),
+        "{url} does not contain the complete query set for scale {scale}"
+    );
 }
 
 fn run_operations(store: &Store, operations: &[Operation], with_opts: bool) {
@@ -280,6 +495,63 @@ fn run_operations(store: &Store, operations: &[Operation], with_opts: bool) {
     }
 }
 
+enum UnsupportedQueryHandling {
+    Skip,
+    Panic,
+}
+
+fn run_operations_incremental(
+    dataset: &Dataset,
+    operations: &[Operation],
+    with_opts: bool,
+    unsupported: UnsupportedQueryHandling,
+) {
+    let mut evaluator = QueryEvaluator::new();
+    if !with_opts {
+        evaluator = evaluator.without_optimizations();
+    }
+    for operation in operations {
+        let Operation::Query(query) = operation else {
+            panic!("incremental operation benchmark only supports queries");
+        };
+        let mut state = match evaluator
+            .prepare(query)
+            .execute_incremental_results(dataset)
+        {
+            Ok(state) => state,
+            Err(error) => {
+                if matches!(unsupported, UnsupportedQueryHandling::Skip)
+                    && is_unsupported_incremental_error(&error)
+                {
+                    continue;
+                }
+                panic!("incremental query execution failed: {error}");
+            }
+        };
+        match state.results() {
+            Ok(spareval::IncrementalQueryResults::Solutions(results)) => for _ in results {},
+            Ok(spareval::IncrementalQueryResults::Boolean(_)) => (),
+            Ok(spareval::IncrementalQueryResults::Graph(results)) => for _ in results {},
+            Err(error)
+                if matches!(unsupported, UnsupportedQueryHandling::Skip)
+                    && is_unsupported_incremental_error(&error) =>
+            {
+                ()
+            }
+            Err(error) => panic!("incremental query results failed: {error}"),
+        }
+    }
+}
+
+fn is_unsupported_incremental_error(error: &QueryEvaluationError) -> bool {
+    let QueryEvaluationError::Unexpected(error) = error else {
+        return false;
+    };
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::Unsupported)
+}
+
 fn sparql_parsing(c: &mut Criterion) {
     let operations = bsbm_sparql_operation("exploreAndUpdate-1000.csv.bz2");
     let mut group = c.benchmark_group("sparql parsing");
@@ -310,8 +582,13 @@ fn sparql_parsing(c: &mut Criterion) {
 }
 
 criterion_group!(parse, parse_bsbm);
-criterion_group!(store, sparql_parsing, store_query_and_update, store_load);
-
+criterion_group!(
+    store,
+    sparql_parsing,
+    store_query_and_update,
+    store_watdiv,
+    store_load
+);
 criterion_main!(parse, store);
 
 fn read_bz2_data(url: &str) -> Vec<u8> {
@@ -359,6 +636,52 @@ fn bsbm_sparql_operation(file_name: &str) -> Vec<RawOperation> {
             }
         })
         .collect()
+}
+
+fn watdiv_sparql_queries(directory: &Path, names: &[&str]) -> Vec<Operation> {
+    names
+        .iter()
+        .flat_map(|name| {
+            let path = directory.join(format!("{name}.sparql"));
+            read_watdiv_queries(&path)
+        })
+        .map(|query| Operation::Query(Query::from_str(&query).unwrap()))
+        .collect()
+}
+
+fn read_watdiv_queries(path: &Path) -> Vec<String> {
+    let mut queries = Vec::new();
+    let mut query = String::new();
+    let mut brace_depth = 0i64;
+    for line in fs::read_to_string(path).unwrap().lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(line);
+        brace_depth += line.matches('{').count() as i64;
+        brace_depth -= line.matches('}').count() as i64;
+        if brace_depth == 0 && line.ends_with('}') {
+            queries.push(std::mem::take(&mut query));
+        }
+    }
+    assert!(
+        query.is_empty(),
+        "incomplete WatDiv query in {}",
+        path.display()
+    );
+    queries
+}
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .to_owned()
 }
 
 fn sparqloscope_operations() -> Vec<(String, Vec<Operation>)> {

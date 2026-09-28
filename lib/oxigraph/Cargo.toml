@@ -63,7 +63,10 @@ codspeed-criterion-compat.workspace = true
 csv.workspace = true
 oxhttp = { workspace = true, features = ["rustls-ring-native"] }
 bzip2.workspace = true
+flate2.workspace = true
+tar = "0.4"
 tempfile.workspace = true
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true
@@ -73,5 +76,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [[bench]]
 name = "store"
+harness = false
+required-features = ["rocksdb"]
+
+[[bench]]
+name = "incremental-store"
 harness = false
 required-features = ["rocksdb"]
