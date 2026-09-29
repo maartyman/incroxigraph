@@ -8,7 +8,7 @@ use oxigraph::io::{JsonLdProfile, JsonLdProfileSet, RdfFormat, RdfParser, RdfSer
 use oxigraph::model::Dataset;
 use oxigraph::sparql::{QueryEvaluationError, QueryResults, SparqlEvaluator};
 use oxigraph::store::Store;
-use spareval::QueryEvaluator;
+use spareval::{IncrementalQueryableDataset, QueryEvaluator};
 use spargebra::{Query, Update};
 use std::fs::File;
 use std::io::Read;
@@ -18,6 +18,9 @@ use std::{fs, str};
 use tempfile::{NamedTempFile, TempDir};
 
 fn parse_bsbm(c: &mut Criterion) {
+    if !workload_selected_by_filter("bsbm") {
+        return;
+    }
     let data = read_bz2_data("https://zenodo.org/records/12663333/files/dataset-1000.nt.bz2");
     do_parse(c, RdfFormat::NTriples, &data);
     do_parse(
@@ -102,6 +105,9 @@ fn convert_from_nt(data: &[u8], to_format: RdfFormat) -> Vec<u8> {
 }
 
 fn store_load(c: &mut Criterion) {
+    if !workload_selected_by_filter("bsbm") {
+        return;
+    }
     let data = read_bz2_data("https://zenodo.org/records/12663333/files/dataset-1000.nt.bz2");
     let mut group = c.benchmark_group("store load");
     group.throughput(Throughput::Bytes(data.len() as u64));
@@ -148,7 +154,27 @@ fn do_bulk_load(store: &Store, data: &[u8]) {
     store.optimize().unwrap();
 }
 
+fn do_bulk_load_file(store: &Store, data_path: &Path) {
+    let mut loader = store.bulk_loader();
+    loader
+        .load_from_reader(
+            RdfParser::from_format(RdfFormat::NTriples).lenient(),
+            File::open(data_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read static WatDiv data {}: {error}",
+                    data_path.display()
+                )
+            }),
+        )
+        .unwrap();
+    loader.commit().unwrap();
+    store.optimize().unwrap();
+}
+
 fn store_query_and_update(c: &mut Criterion) {
+    if !workload_selected_by_filter("bsbm") {
+        return;
+    }
     for (data_size, without_opts) in [(1_000, true), (5_000, false)] {
         do_store_query_and_update(c, data_size, without_opts)
     }
@@ -307,6 +333,9 @@ fn do_store_query_and_update(c: &mut Criterion, data_size: usize, without_ops: b
 }
 
 fn store_watdiv(c: &mut Criterion) {
+    if !workload_selected_by_filter("watdiv") {
+        return;
+    }
     let scale = std::env::var("WATDIV_STORE_SCALE")
         .ok()
         .map(|scale| {
@@ -336,31 +365,20 @@ fn store_watdiv(c: &mut Criterion) {
     let mut group = c.benchmark_group("store WatDiv operations in memory");
     group.sample_size(10);
 
-    let memory_store = Store::new().unwrap();
-    let data = fs::read(&data_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read static WatDiv data {}: {error}",
-            data_path.display()
-        )
-    });
-    do_bulk_load(&memory_store, &data);
-    let incremental_dataset = Dataset::from_iter(memory_store.iter().map(|quad| quad.unwrap()));
-    group.bench_function(format!("WatDiv stress {scale} in memory"), |b| {
-        b.iter(|| run_operations(&memory_store, &stress_queries, true))
-    });
-    group.bench_function(
-        format!("WatDiv stress {scale} in memory with incremental engine"),
-        |b| {
-            b.iter(|| {
-                run_operations_incremental(
-                    &incremental_dataset,
-                    &stress_queries,
-                    true,
-                    UnsupportedQueryHandling::Panic,
-                )
-            })
-        },
-    );
+    let store = Store::new().unwrap();
+    do_bulk_load_file(&store, &data_path);
+    for (batch_id, queries) in stress_queries.chunks(10).enumerate() {
+        let first_query_id = batch_id * 10 + 1;
+        let last_query_id = first_query_id + queries.len() - 1;
+        group.bench_function(
+            format!("WatDiv stress {scale} queries {first_query_id}-{last_query_id} in memory"),
+            |b| b.iter(|| run_operations(&store, queries, true)),
+        );
+        group.bench_function(
+            format!("WatDiv stress {scale} queries {first_query_id}-{last_query_id} in memory with incremental engine"),
+            |b| b.iter(|| run_store_operations_incremental(&store, queries)),
+        );
+    }
 }
 
 fn watdiv_download_dir() -> PathBuf {
@@ -497,26 +515,25 @@ fn run_operations(store: &Store, operations: &[Operation], with_opts: bool) {
 
 enum UnsupportedQueryHandling {
     Skip,
-    Panic,
 }
 
-fn run_operations_incremental(
-    dataset: &Dataset,
+fn run_operations_incremental<'a, D: IncrementalQueryableDataset<'a> + Clone>(
+    dataset: D,
     operations: &[Operation],
     with_opts: bool,
     unsupported: UnsupportedQueryHandling,
 ) {
-    let mut evaluator = QueryEvaluator::new();
-    if !with_opts {
-        evaluator = evaluator.without_optimizations();
-    }
     for operation in operations {
         let Operation::Query(query) = operation else {
             panic!("incremental operation benchmark only supports queries");
         };
+        let mut evaluator = QueryEvaluator::new();
+        if !with_opts {
+            evaluator = evaluator.without_optimizations();
+        }
         let mut state = match evaluator
             .prepare(query)
-            .execute_incremental_results(dataset)
+            .execute_incremental_results(dataset.clone())
         {
             Ok(state) => state,
             Err(error) => {
@@ -543,6 +560,31 @@ fn run_operations_incremental(
     }
 }
 
+fn run_store_operations_incremental(store: &Store, operations: &[Operation]) {
+    for operation in operations {
+        let Operation::Query(query) = operation else {
+            panic!("incremental operation benchmark only supports queries");
+        };
+        let mut state = SparqlEvaluator::new()
+            .for_query(query.clone())
+            .on_store(store)
+            .execute_incremental_results()
+            .unwrap_or_else(|error| panic!("incremental query execution failed: {error}"));
+        let results = state
+            .results()
+            .unwrap_or_else(|error| panic!("incremental query results failed: {error}"));
+        match results {
+            oxigraph::sparql::IncrementalQueryResults::Solutions(results) => {
+                for _ in results {}
+            }
+            oxigraph::sparql::IncrementalQueryResults::Boolean(_) => (),
+            oxigraph::sparql::IncrementalQueryResults::Graph(results) => {
+                for _ in results {}
+            }
+        }
+    }
+}
+
 fn is_unsupported_incremental_error(error: &QueryEvaluationError) -> bool {
     let QueryEvaluationError::Unexpected(error) = error else {
         return false;
@@ -553,6 +595,9 @@ fn is_unsupported_incremental_error(error: &QueryEvaluationError) -> bool {
 }
 
 fn sparql_parsing(c: &mut Criterion) {
+    if !workload_selected_by_filter("bsbm") {
+        return;
+    }
     let operations = bsbm_sparql_operation("exploreAndUpdate-1000.csv.bz2");
     let mut group = c.benchmark_group("sparql parsing");
     group.sample_size(10);
@@ -590,6 +635,21 @@ criterion_group!(
     store_load
 );
 criterion_main!(parse, store);
+
+fn workload_selected_by_filter(workload: &str) -> bool {
+    let mut bsbm = false;
+    let mut watdiv = false;
+    for arg in std::env::args().skip(1) {
+        let arg = arg.to_ascii_lowercase();
+        bsbm |= arg.contains("bsbm");
+        watdiv |= arg.contains("watdiv");
+    }
+    match (bsbm, watdiv) {
+        (true, false) => workload == "bsbm",
+        (false, true) => workload == "watdiv",
+        _ => true,
+    }
+}
 
 fn read_bz2_data(url: &str) -> Vec<u8> {
     let url = Uri::from_str(url).unwrap();

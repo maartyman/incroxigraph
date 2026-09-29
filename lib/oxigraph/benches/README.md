@@ -12,10 +12,10 @@ Run commands from the workspace root with the `rocksdb` feature. The two targets
 ## Static WatDiv (`store.rs`)
 
 The default is scale `100` (10M triples). If missing, the benchmark downloads the [official WatDiv dataset and stress workload](https://dsg.uwaterloo.ca/watdiv/) into `target/watdiv/`. 
-Scale `1000` (100M triples) is also downloadable with `WATDIV_STORE_SCALE=1000`. Smaller scales, including `1` and `10`, must be supplied locally because the official site does not publish pre-generated datasets or stress queries for them. 
-The stress suite uses `test.1`–`test.5`; each file may contain multiple SELECT queries. 
-Both ordinary SPARQL evaluation and initial evaluation with the incremental engine run on the same queries. 
-The dataset is loaded into the default graph once, outside the timed query evaluations. 
+Scale `1000` (100M triples) is also downloadable with `WATDIV_STORE_SCALE=1000`.
+Smaller scales, including `1` and `10`, must be supplied locally because the official site does not publish pre-generated datasets or stress queries for them.
+The stress suite uses `test.1`–`test.5`; each file has 100 SELECT queries. The benchmark reports batches of 10 queries separately, so results appear progressively and a slow portion is easier to identify.
+Both ordinary SPARQL evaluation and initial evaluation with the incremental engine run on the same queries. The dataset is streamed into an in-memory store once per benchmark run, outside the timed query evaluations. The incremental benchmark reads directly from that store without making a second dataset copy. Loading the default 10M-triple dataset may require substantial RAM and startup time.
 No stream events or named-graph union are involved, so the incremental-engine case measures initial result computation, not update maintenance.
 
 ```sh
@@ -25,7 +25,7 @@ cargo bench -p oxigraph --features rocksdb --bench store -- WatDiv
 For files elsewhere, set `WATDIV_STORE_DATA` to the static `.nt` file and `WATDIV_STORE_WORKLOAD_DIR` to the directory containing `watdiv-stress-<scale>/`. 
 Set `WATDIV_STORE_SCALE` to the actual dataset scale. 
 These are the **standard static WatDiv files**, not files from the Stream WatDiv ZIPs. 
-Other `store.rs` benchmark groups still set up (including BSBM data downloads) before Criterion applies the `WatDiv` name filter.
+The `WatDiv` name filter skips the BSBM benchmark groups before they download or initialize their data. With no `WatDiv` or `BSBM` filter, all groups run as usual.
 
 ## Stream WatDiv (`incremental-store.rs`)
 
