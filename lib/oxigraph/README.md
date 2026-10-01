@@ -61,6 +61,80 @@ if let QueryResults::Solutions(mut solutions) = SparqlEvaluator::new()
 }
 ```
 
+## Incremental queries
+
+An incremental query keeps track of a `SELECT`, `ASK`, or `CONSTRUCT` result as the store changes.
+Bind a parsed query with `on_store(&store)`, then choose complete result snapshots or result deltas.
+The query observes committed store changes.
+
+Use `execute_incremental_results()` when you want the current complete result after each change:
+
+```rust
+use oxigraph::model::{GraphName, NamedNode, Quad};
+use oxigraph::sparql::{
+    IncrementalQueryResults, SparqlEvaluator, StoreIncrementalQueryResultsState,
+};
+use oxigraph::store::Store;
+
+let store = Store::new().unwrap();
+let mut query: StoreIncrementalQueryResultsState = SparqlEvaluator::new()
+    .parse_query("SELECT ?s WHERE { ?s ?p ?o }")
+    .unwrap()
+    .on_store(&store)
+    .execute_incremental_results()
+    .unwrap();
+
+if let IncrementalQueryResults::Solutions(rows) = query.results().unwrap() {
+    assert_eq!(rows.count(), 0); // Initial snapshot
+}
+
+let ex = NamedNode::new("http://example.com").unwrap();
+let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), GraphName::DefaultGraph);
+let mut transaction = store.start_transaction().unwrap(); // Grouping updates in a transaction is best for performance.
+transaction.insert(quad.clone());
+transaction.commit().unwrap();
+if let IncrementalQueryResults::Solutions(rows) = query.results().unwrap() {
+    assert_eq!(rows.count(), 1); // Complete result after the insertion
+}
+```
+
+Use `execute_incremental_deltas()` when you maintain your own result set and only need changes since the previous call:
+
+```rust
+use oxigraph::model::{GraphName, NamedNode, Quad};
+use oxigraph::sparql::{Delta, QueryResultsDelta, SparqlEvaluator};
+use oxigraph::store::Store;
+
+let store = Store::new().unwrap();
+let mut query = SparqlEvaluator::new()
+    .parse_query("SELECT ?s WHERE { ?s ?p ?o }").unwrap()
+    .on_store(&store)
+    .execute_incremental_deltas().unwrap();
+
+if let QueryResultsDelta::Solutions(initial) = query.deltas().unwrap() {
+    assert_eq!(initial.count(), 0);
+}
+
+let ex = NamedNode::new("http://example.com").unwrap();
+let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), GraphName::DefaultGraph);
+let mut transaction = store.start_transaction().unwrap(); // Grouping updates in a transaction is best for performance.
+transaction.insert(quad.clone());
+transaction.commit().unwrap();
+if let QueryResultsDelta::Solutions(mut changes) = query.deltas().unwrap() {
+    assert!(matches!(changes.next(), Some(Ok(Delta::Addition(_)))));
+}
+```
+
+For `ASK`, complete results are `IncrementalQueryResults::Boolean(bool)`; deltas emit the initial boolean and later values only when it changes.
+For `CONSTRUCT`, complete results are `IncrementalQueryResults::Graph`, while deltas contain triple additions and deletions.
+Graph results have set semantics. Incremental `DESCRIBE` is not supported.
+
+Both states also offer `iter_results()` or `iter_deltas()` to asynchronously await changes with `next().await`.
+Each call drains changes currently ready, so several commits may be combined into one update.
+Complete snapshots borrow the state: finish using a snapshot before calling `results()` again.
+If you need an explicit type for a store-bound state, use `StoreIncrementalQueryResultsState` or `StoreIncrementalQueryDeltasState`.
+For example, a struct can store the results handle in a field of type `StoreIncrementalQueryResultsState`.
+
 It is based on these crates that can be used separately:
 * [`oxrdf`](https://crates.io/crates/oxrdf), datastructures encoding RDF basic concepts (the [`oxigraph::model`](crate::model) module).
 * [`oxrdfio`](https://crates.io/crates/oxrdfio), a unified parser and serializer API for RDF formats (the [`oxigraph::io`](crate::io) module). It itself relies on:

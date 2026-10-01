@@ -23,29 +23,26 @@
 //! use oxigraph::sparql::{IncrementalQueryResults, SparqlEvaluator};
 //! use oxigraph::store::Store;
 //!
-//! let store = Store::new()?;
+//! let store = Store::new().unwrap();
 //! let mut query = SparqlEvaluator::new()
-//!     .parse_query("SELECT ?s WHERE { ?s <urn:p> <urn:o> }")?
+//!     .parse_query("SELECT ?s WHERE { ?s ?p ?o }").unwrap()
 //!     .on_store(&store)
-//!     .execute_incremental_results()?;
+//!     .execute_incremental_results().unwrap();
 //!
-//! let IncrementalQueryResults::Solutions(rows) = query.results()? else {
+//! let IncrementalQueryResults::Solutions(rows) = query.results().unwrap() else {
 //!     unreachable!()
 //! };
 //! assert_eq!(rows.count(), 0);
 //!
-//! let subject = NamedNode::new("urn:s")?;
-//! store.insert(Quad::new(
-//!     subject.clone(),
-//!     NamedNode::new("urn:p")?,
-//!     NamedNode::new("urn:o")?,
-//!     GraphName::DefaultGraph,
-//! ))?;
-//! let IncrementalQueryResults::Solutions(mut rows) = query.results()? else {
+//! let ex = NamedNode::new("http://example.com").unwrap();
+//! let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), GraphName::DefaultGraph);
+//! let mut transaction = store.start_transaction().unwrap(); // Grouping updates in a transaction is best for performance.
+//! transaction.insert(quad.clone());
+//! transaction.commit().unwrap();
+//! let IncrementalQueryResults::Solutions(mut rows) = query.results().unwrap() else {
 //!     unreachable!()
 //! };
-//! assert_eq!(rows.next().unwrap().get("s"), Some(&subject.into()));
-//! # Result::<_, Box<dyn std::error::Error>>::Ok(())
+//! assert_eq!(rows.next().unwrap().get("s"), Some(&ex.into()));
 //! ```
 //!
 //! Use deltas when maintaining your own view of the results. `SELECT` yields row additions and
@@ -57,28 +54,27 @@
 //! use oxigraph::sparql::{Delta, QueryResultsDelta, SparqlEvaluator};
 //! use oxigraph::store::Store;
 //!
-//! let store = Store::new()?;
+//! let store = Store::new().unwrap();
 //! let mut query = SparqlEvaluator::new()
-//!     .parse_query("SELECT ?s WHERE { ?s <urn:p> <urn:o> }")?
+//!     .parse_query("SELECT ?s WHERE { ?s ?p ?o }").unwrap()
 //!     .on_store(&store)
-//!     .execute_incremental_deltas()?;
-//! let QueryResultsDelta::Solutions(initial) = query.deltas()? else { unreachable!() };
+//!     .execute_incremental_deltas().unwrap();
+//! let QueryResultsDelta::Solutions(initial) = query.deltas().unwrap() else { unreachable!() };
 //! assert_eq!(initial.count(), 0);
 //!
-//! store.insert(Quad::new(
-//!     NamedNode::new("urn:s")?,
-//!     NamedNode::new("urn:p")?,
-//!     NamedNode::new("urn:o")?,
-//!     GraphName::DefaultGraph,
-//! ))?;
-//! let QueryResultsDelta::Solutions(changes) = query.deltas()? else { unreachable!() };
+//! let ex = NamedNode::new("http://example.com").unwrap();
+//! let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), GraphName::DefaultGraph);
+//! let mut transaction = store.start_transaction().unwrap();
+//! // Grouping updates in a transaction is best for performance.
+//! transaction.insert(quad.clone());
+//! transaction.commit().unwrap();
+//! let QueryResultsDelta::Solutions(changes) = query.deltas().unwrap() else { unreachable!() };
 //! for change in changes {
-//!     match change? {
+//!     match change.unwrap() {
 //!         Delta::Addition(solution) => assert!(solution.get("s").is_some()),
 //!         Delta::Deletion(_) => unreachable!(),
 //!     }
 //! }
-//! # Result::<_, Box<dyn std::error::Error>>::Ok(())
 //! ```
 //!
 //! `ASK` and `CONSTRUCT` use the same entry point, with different delta variants:
@@ -88,29 +84,28 @@
 //! use oxigraph::sparql::{Delta, QueryResultsDelta, SparqlEvaluator};
 //! use oxigraph::store::Store;
 //!
-//! let store = Store::new()?;
+//! let store = Store::new().unwrap();
 //! let mut ask = SparqlEvaluator::new()
-//!     .parse_query("ASK { ?s <urn:p> ?o }")?
+//!     .parse_query("ASK { ?s <urn:p> ?o }").unwrap()
 //!     .on_store(&store)
-//!     .execute_incremental_deltas()?;
+//!     .execute_incremental_deltas().unwrap();
 //! let mut construct = SparqlEvaluator::new()
-//!     .parse_query("CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }")?
+//!     .parse_query("CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }").unwrap()
 //!     .on_store(&store)
-//!     .execute_incremental_deltas()?;
-//! let QueryResultsDelta::Boolean(initial) = ask.deltas()? else { unreachable!() };
-//! assert_eq!(initial.collect::<Result<Vec<_>, _>>()?, [false]);
+//!     .execute_incremental_deltas().unwrap();
+//! let QueryResultsDelta::Boolean(initial) = ask.deltas().unwrap() else { unreachable!() };
+//! assert_eq!(initial.collect::<Result<Vec<_>, _>>().unwrap(), [false]);
 //!
-//! store.insert(Quad::new(
-//!     NamedNode::new("urn:s")?,
-//!     NamedNode::new("urn:p")?,
-//!     NamedNode::new("urn:o")?,
-//!     GraphName::DefaultGraph,
-//! ))?;
-//! let QueryResultsDelta::Boolean(values) = ask.deltas()? else { unreachable!() };
-//! assert_eq!(values.collect::<Result<Vec<_>, _>>()?, [true]);
-//! let QueryResultsDelta::Graph(triples) = construct.deltas()? else { unreachable!() };
-//! assert!(matches!(triples.collect::<Result<Vec<_>, _>>()?.as_slice(), [Delta::Addition(_)]));
-//! # Result::<_, Box<dyn std::error::Error>>::Ok(())
+//! let ex = NamedNode::new("http://example.com").unwrap();
+//! let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), GraphName::DefaultGraph);
+//! let mut transaction = store.start_transaction().unwrap();
+//! // Grouping updates in a transaction is best for performance.
+//! transaction.insert(quad.clone());
+//! transaction.commit().unwrap();
+//! let QueryResultsDelta::Boolean(values) = ask.deltas().unwrap() else { unreachable!() };
+//! assert_eq!(values.collect::<Result<Vec<_>, _>>().unwrap(), [true]);
+//! let QueryResultsDelta::Graph(triples) = construct.deltas().unwrap() else { unreachable!() };
+//! assert!(matches!(triples.collect::<Result<Vec<_>, _>>().unwrap().as_slice(), [Delta::Addition(_)]));
 //! ```
 //!
 //! To wait instead of polling, call [`IncrementalQueryResultsState::iter_results`] or
@@ -118,28 +113,27 @@
 //! its initial result, even when empty; delta iteration waits for a non-empty `SELECT` or
 //! `CONSTRUCT` batch. `ASK` deltas yield the initial boolean. A call drains all changes ready
 //! at that time and may combine several commits; it does not report every intermediate value.
-//! An asynchronous consumer can stop on an error by returning it from its task:
+//! An asynchronous consumer can process changes as they arrive:
 //!
 //! ```no_run
 //! use oxigraph::sparql::{QueryResultsDelta, SparqlEvaluator};
 //! use oxigraph::store::Store;
 //!
-//! async fn watch(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
+//! async fn watch(store: &Store) {
 //!     let mut query = SparqlEvaluator::new()
-//!         .parse_query("SELECT ?s WHERE { ?s <urn:p> ?o }")?
+//!         .parse_query("SELECT ?s WHERE { ?s <urn:p> ?o }").unwrap()
 //!         .on_store(store)
-//!         .execute_incremental_deltas()?;
+//!         .execute_incremental_deltas().unwrap();
 //!     let mut batches = query.iter_deltas();
 //!     while let Some(batch) = batches.next().await {
-//!         if let QueryResultsDelta::Solutions(rows) = batch? {
+//!         if let QueryResultsDelta::Solutions(rows) = batch.unwrap() {
 //!             for row in rows {
-//!                 let change = row?;
+//!                 let change = row.unwrap();
 //!                 // Update an application-owned cache using change.
 //!                 let _ = change;
 //!             }
 //!         }
 //!     }
-//!     Ok(())
 //! }
 //! # let _ = watch;
 //! ```
