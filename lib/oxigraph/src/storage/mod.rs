@@ -15,9 +15,8 @@ use crate::storage::rocksdb::{
 };
 use oxstr::OxString;
 use rustc_hash::{FxBuildHasher, FxHashSet};
-use spareval::{Delta, IncrementalQueryNotifier};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::mem::take;
+use spareval::{Delta, IncrementalQueryNotifier, QueryEvaluationError};
+use std::collections::{HashMap, VecDeque};
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
@@ -73,30 +72,10 @@ enum StorageKind {
 struct IncrementalState {
     subscribers: Vec<Option<IncrementalSubscriber>>,
     free_subscriber_slots: Vec<usize>,
-    subscription_index: IncrementalSubscriptionIndex,
-}
-
-impl IncrementalState {
-    fn for_each_matching_subscriber(
-        &mut self,
-        quad: &EncodedQuad,
-        mut callback: impl FnMut(&mut IncrementalSubscriber),
-    ) {
-        let subscription_index = &self.subscription_index;
-        let subscribers = &mut self.subscribers;
-        subscription_index.for_each_candidate(quad, |id| {
-            if let Some(subscriber) = subscribers.get_mut(id).and_then(Option::as_mut)
-                && subscriber.pattern.matches(quad)
-            {
-                callback(subscriber);
-            }
-        });
-    }
 }
 
 struct IncrementalSubscriber {
-    pattern: IncrementalQuadPattern,
-    changes: VecDeque<Delta<EncodedQuad>>,
+    changes: VecDeque<Vec<Delta<EncodedQuad>>>,
     notifier: Weak<IncrementalQueryNotifier>,
 }
 
@@ -106,149 +85,6 @@ struct IncrementalQuadPattern {
     predicate: Option<EncodedTerm>,
     object: Option<EncodedTerm>,
     graph_name: Option<Option<EncodedTerm>>,
-}
-
-impl IncrementalQuadPattern {
-    fn matches(&self, quad: &EncodedQuad) -> bool {
-        self.subject
-            .as_ref()
-            .is_none_or(|subject| quad.subject == *subject)
-            && self
-                .predicate
-                .as_ref()
-                .is_none_or(|predicate| quad.predicate == *predicate)
-            && self
-                .object
-                .as_ref()
-                .is_none_or(|object| quad.object == *object)
-            && self
-                .graph_name
-                .as_ref()
-                .is_none_or(|graph_name| match graph_name {
-                    Some(graph_name) => quad.graph_name == *graph_name,
-                    None => quad.graph_name.is_default_graph(),
-                })
-    }
-}
-
-#[derive(Default)]
-struct IncrementalSubscriptionIndex {
-    unconstrained: HashSet<usize>,
-    by_subject: HashMap<EncodedTerm, HashSet<usize>>,
-    by_predicate: HashMap<EncodedTerm, HashSet<usize>>,
-    by_object: HashMap<EncodedTerm, HashSet<usize>>,
-    by_graph_name: HashMap<EncodedTerm, HashSet<usize>>,
-}
-
-impl IncrementalSubscriptionIndex {
-    fn insert(&mut self, id: usize, pattern: &IncrementalQuadPattern) {
-        let mut constrained = false;
-        if let Some(subject) = &pattern.subject {
-            self.by_subject
-                .entry(subject.clone())
-                .or_default()
-                .insert(id);
-            constrained = true;
-        }
-        if let Some(predicate) = &pattern.predicate {
-            self.by_predicate
-                .entry(predicate.clone())
-                .or_default()
-                .insert(id);
-            constrained = true;
-        }
-        if let Some(object) = &pattern.object {
-            self.by_object.entry(object.clone()).or_default().insert(id);
-            constrained = true;
-        }
-        if let Some(graph_name) = &pattern.graph_name {
-            self.by_graph_name
-                .entry(graph_name.clone().unwrap_or(EncodedTerm::DefaultGraph))
-                .or_default()
-                .insert(id);
-            constrained = true;
-        }
-        if !constrained {
-            self.unconstrained.insert(id);
-        }
-    }
-
-    fn remove(&mut self, id: usize, pattern: &IncrementalQuadPattern) {
-        if let Some(subject) = &pattern.subject {
-            remove_subscription_index_entry(&mut self.by_subject, subject, id);
-        }
-        if let Some(predicate) = &pattern.predicate {
-            remove_subscription_index_entry(&mut self.by_predicate, predicate, id);
-        }
-        if let Some(object) = &pattern.object {
-            remove_subscription_index_entry(&mut self.by_object, object, id);
-        }
-        if let Some(graph_name) = &pattern.graph_name {
-            remove_subscription_index_entry(
-                &mut self.by_graph_name,
-                &graph_name.clone().unwrap_or(EncodedTerm::DefaultGraph),
-                id,
-            );
-        }
-        if pattern.subject.is_none()
-            && pattern.predicate.is_none()
-            && pattern.object.is_none()
-            && pattern.graph_name.is_none()
-        {
-            self.unconstrained.remove(&id);
-        }
-    }
-
-    fn for_each_candidate(&self, quad: &EncodedQuad, mut callback: impl FnMut(usize)) {
-        // Unconstrained subscriptions are never present in the component indexes.
-        for &id in &self.unconstrained {
-            callback(id);
-        }
-
-        let matching_indexes = [
-            self.by_subject.get(&quad.subject),
-            self.by_predicate.get(&quad.predicate),
-            self.by_object.get(&quad.object),
-            self.by_graph_name.get(&quad.graph_name),
-        ];
-        if matching_indexes.iter().filter(|ids| ids.is_some()).count() < 2 {
-            for ids in matching_indexes.into_iter().flatten() {
-                for &id in ids {
-                    callback(id);
-                }
-            }
-            return;
-        }
-
-        let mut visited = HashSet::with_capacity(
-            matching_indexes
-                .iter()
-                .flatten()
-                .map(|ids| ids.len())
-                .max()
-                .unwrap_or(0),
-        );
-        for ids in matching_indexes.into_iter().flatten() {
-            for &id in ids {
-                if visited.insert(id) {
-                    callback(id);
-                }
-            }
-        }
-    }
-}
-
-fn remove_subscription_index_entry(
-    index: &mut HashMap<EncodedTerm, HashSet<usize>>,
-    key: &EncodedTerm,
-    id: usize,
-) {
-    if let Some(ids) = index.get_mut(key) {
-        ids.remove(&id);
-        if ids.is_empty() {
-            index.remove(key);
-        }
-    }
 }
 
 impl Storage {
@@ -394,7 +230,7 @@ impl Storage {
 
     fn queue_committed_quad_changes(
         &self,
-        changes: Vec<Delta<EncodedQuad>>,
+        changes: &[Delta<EncodedQuad>],
     ) -> HashMap<*const IncrementalQueryNotifier, Weak<IncrementalQueryNotifier>> {
         if changes.is_empty() {
             return HashMap::new();
@@ -402,14 +238,11 @@ impl Storage {
         let mut state = self.incremental_state.lock().unwrap();
         let mut notifiers = HashMap::new();
 
-        for delta in changes {
-            state.for_each_matching_subscriber(delta.value(), |subscriber| {
-                subscriber.changes.push_back(delta.clone());
-
-                notifiers
-                    .entry(subscriber.notifier.as_ptr())
-                    .or_insert_with(|| Weak::clone(&subscriber.notifier));
-            });
+        for subscriber in state.subscribers.iter_mut().flatten() {
+            subscriber.changes.push_back(changes.to_vec());
+            notifiers
+                .entry(subscriber.notifier.as_ptr())
+                .or_insert_with(|| Weak::clone(&subscriber.notifier));
         }
         notifiers
     }
@@ -492,6 +325,18 @@ impl<'a> StorageReader<'a> {
         }
     }
 
+    /// Pushes the initial storage snapshot into an incremental query's input.
+    /// The physical index scan remains local to storage; no query operator pulls it.
+    pub fn push_incremental_snapshot(
+        &self,
+        emit: &mut dyn FnMut(EncodedQuad) -> Result<(), QueryEvaluationError>,
+    ) -> Result<(), QueryEvaluationError> {
+        for quad in self.quads_for_pattern(None, None, None, None) {
+            emit(quad.map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))?)?;
+        }
+        Ok(())
+    }
+
     pub fn triples_for_pattern(
         &self,
         subject: Option<&EncodedTerm>,
@@ -571,10 +416,6 @@ impl<'a> StorageReader<'a> {
 
     pub fn subscribe_incremental_quads(
         &self,
-        subject: Option<&EncodedTerm>,
-        predicate: Option<&EncodedTerm>,
-        object: Option<&EncodedTerm>,
-        graph_name: Option<Option<&EncodedTerm>>,
         notifier: Weak<IncrementalQueryNotifier>,
     ) -> (usize, Option<StorageReader<'static>>) {
         // Register before taking the fresh snapshot while commits are excluded. A commit is
@@ -586,15 +427,7 @@ impl<'a> StorageReader<'a> {
             .free_subscriber_slots
             .pop()
             .unwrap_or_else(|| state.subscribers.len());
-        let pattern = IncrementalQuadPattern {
-            subject: subject.cloned(),
-            predicate: predicate.cloned(),
-            object: object.cloned(),
-            graph_name: graph_name.map(<Option<&EncodedTerm>>::cloned),
-        };
-        state.subscription_index.insert(slot, &pattern);
         let subscriber = Some(IncrementalSubscriber {
-            pattern,
             changes: VecDeque::new(),
             notifier,
         });
@@ -621,19 +454,23 @@ impl<'a> StorageReader<'a> {
         (slot, snapshot)
     }
 
-    pub fn incremental_quad_subscription_changes(&self, id: usize) -> VecDeque<Delta<EncodedQuad>> {
+    pub fn incremental_quad_subscription_changes(
+        &self,
+        id: usize,
+    ) -> Option<Vec<Delta<EncodedQuad>>> {
         let mut state = self.incremental_state.lock().unwrap();
-        state
-            .subscribers
-            .get_mut(id)
-            .and_then(Option::as_mut)
-            .map_or_else(VecDeque::new, |subscriber| take(&mut subscriber.changes))
+        let subscriber = state.subscribers.get_mut(id).and_then(Option::as_mut)?;
+        subscriber.changes.pop_front()
     }
 
     pub fn unsubscribe_incremental_quads(&self, id: usize) {
         let mut state = self.incremental_state.lock().unwrap();
-        if let Some(subscriber) = state.subscribers.get_mut(id).and_then(Option::take) {
-            state.subscription_index.remove(id, &subscriber.pattern);
+        if state
+            .subscribers
+            .get_mut(id)
+            .and_then(Option::take)
+            .is_some()
+        {
             state.free_subscriber_slots.push(id);
         }
     }
@@ -994,7 +831,7 @@ impl IncrementalTransactionState {
                 self.prepare_changes()?
             };
             commit()?;
-            storage.queue_committed_quad_changes(changes)
+            storage.queue_committed_quad_changes(&changes)
         };
         // Waking may run arbitrary executor code, so it must happen outside of
         // both the commit-order lock and the incremental-state lock.
@@ -1425,7 +1262,7 @@ impl StorageBulkLoader<'_> {
                     loader.load_batch(quads, max_num_threads)?;
                     let after = storage.snapshot();
                     let changes = self.incremental.take_visible_additions(&before, &after)?;
-                    Ok(storage.queue_committed_quad_changes(changes))
+                    Ok(storage.queue_committed_quad_changes(&changes))
                 })();
                 loader.run_progress_callbacks();
                 let notifiers = result?;

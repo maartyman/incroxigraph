@@ -4,7 +4,6 @@
 use oxigraph::io::RdfFormat;
 use oxigraph::model::vocab::{rdf, xsd};
 use oxigraph::model::*;
-#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use oxigraph::sparql::QueryResults;
 use oxigraph::sparql::{
     Delta, IncrementalQueryResults, QueryResultsDelta, SparqlEvaluator,
@@ -124,6 +123,345 @@ fn incremental_query_deltas_support_all_result_kinds() -> Result<(), Box<dyn Err
         unreachable!("expected a triple deletion")
     };
     assert_eq!(removed, initial);
+    Ok(())
+}
+
+#[test]
+fn incremental_join_uses_query_local_terms_across_updates() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let p = NamedNode::new_unchecked("urn:p");
+    let q = NamedNode::new_unchecked("urn:q");
+    let o = NamedNode::new_unchecked("urn:o");
+    let s1 = NamedNode::new_unchecked("urn:s1");
+    let s2 = NamedNode::new_unchecked("urn:s2");
+    let x = NamedNode::new_unchecked("urn:x");
+    let p1 = Quad::new(s1.clone(), p.clone(), o.clone(), GraphName::DefaultGraph);
+    let p2 = Quad::new(s2.clone(), p.clone(), o.clone(), GraphName::DefaultGraph);
+    let q1 = Quad::new(o.clone(), q.clone(), x, GraphName::DefaultGraph);
+    let q_other = Quad::new(
+        o.clone(),
+        q.clone(),
+        NamedNode::new_unchecked("urn:other-x"),
+        GraphName::DefaultGraph,
+    );
+    store.insert(p1.clone())?;
+    store.insert(p2.clone())?;
+    store.insert(q1.clone())?;
+    store.insert(q_other)?;
+
+    let mut query = SparqlEvaluator::new()
+        .parse_query("SELECT ?s WHERE { ?s <urn:p> ?o . ?o <urn:q> ?x }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let QueryResultsDelta::Solutions(initial) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    let initial = initial.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(initial.len(), 4);
+    assert!(
+        initial
+            .iter()
+            .all(|change| matches!(change, Delta::Addition(_)))
+    );
+
+    store.remove(&q1)?;
+    let QueryResultsDelta::Solutions(removed) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    let removed = removed.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(removed.len(), 2);
+    assert!(
+        removed
+            .iter()
+            .all(|change| matches!(change, Delta::Deletion(_)))
+    );
+
+    let p3 = Quad::new(
+        NamedNode::new_unchecked("urn:s3"),
+        p,
+        NamedNode::new_unchecked("urn:new-o"),
+        GraphName::DefaultGraph,
+    );
+    let q2 = Quad::new(
+        NamedNode::new_unchecked("urn:new-o"),
+        q,
+        NamedNode::new_unchecked("urn:new-x"),
+        GraphName::DefaultGraph,
+    );
+    let mut transaction = store.start_transaction()?;
+    transaction.insert(p3);
+    transaction.insert(q2);
+    transaction.commit()?;
+    let QueryResultsDelta::Solutions(added) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    let added = added.collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        matches!(added.as_slice(), [Delta::Addition(row)] if row.get("s") == Some(&NamedNode::new_unchecked("urn:s3").into()))
+    );
+    Ok(())
+}
+
+#[test]
+fn incremental_cartesian_join_keeps_values_live() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let first = Quad::new(
+        NamedNode::new_unchecked("urn:s1"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    let second = Quad::new(
+        NamedNode::new_unchecked("urn:s2"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    store.insert(first.clone())?;
+    let mut query = SparqlEvaluator::new()
+        .without_optimizations()
+        .parse_query("SELECT ?s ?v WHERE { VALUES ?v { <urn:v1> <urn:v2> } ?s <urn:p> <urn:o> }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+
+    let QueryResultsDelta::Solutions(initial) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    assert_eq!(initial.collect::<Result<Vec<_>, _>>()?.len(), 2);
+
+    store.insert(second)?;
+    let QueryResultsDelta::Solutions(added) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    let added = added.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(added.len(), 2);
+    assert!(
+        added
+            .iter()
+            .all(|change| matches!(change, Delta::Addition(_)))
+    );
+
+    store.remove(&first)?;
+    let QueryResultsDelta::Solutions(removed) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    let removed = removed.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(removed.len(), 2);
+    assert!(
+        removed
+            .iter()
+            .all(|change| matches!(change, Delta::Deletion(_)))
+    );
+    Ok(())
+}
+
+#[test]
+fn incremental_nested_joins_share_query_term_ids() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let p = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    let q = Quad::new(
+        NamedNode::new_unchecked("urn:o"),
+        NamedNode::new_unchecked("urn:q"),
+        NamedNode::new_unchecked("urn:x"),
+        GraphName::DefaultGraph,
+    );
+    let r = Quad::new(
+        NamedNode::new_unchecked("urn:x"),
+        NamedNode::new_unchecked("urn:r"),
+        NamedNode::new_unchecked("urn:z"),
+        GraphName::DefaultGraph,
+    );
+    store.insert(p)?;
+    store.insert(q)?;
+    store.insert(r.clone())?;
+    let mut query = SparqlEvaluator::new()
+        .parse_query("SELECT ?s WHERE { ?s <urn:p> ?o . ?o <urn:q> ?x . ?x <urn:r> ?z }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+
+    let QueryResultsDelta::Solutions(initial) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    assert!(matches!(
+        initial.collect::<Result<Vec<_>, _>>()?.as_slice(),
+        [Delta::Addition(_)]
+    ));
+
+    store.remove(&r)?;
+    let QueryResultsDelta::Solutions(removed) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    assert!(matches!(
+        removed.collect::<Result<Vec<_>, _>>()?.as_slice(),
+        [Delta::Deletion(_)]
+    ));
+    Ok(())
+}
+
+#[test]
+fn incremental_default_graph_merge_is_distinct_across_commits() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let first = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        NamedNode::new_unchecked("urn:g1"),
+    );
+    let second = Quad::new(
+        first.subject.clone(),
+        first.predicate.clone(),
+        first.object.clone(),
+        NamedNode::new_unchecked("urn:g2"),
+    );
+    store.insert(first.clone())?;
+    store.insert(second.clone())?;
+    let mut query = SparqlEvaluator::new()
+        .parse_query("SELECT ?s FROM <urn:g1> FROM <urn:g2> WHERE { ?s <urn:p> <urn:o> }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+
+    let QueryResultsDelta::Solutions(initial) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    assert!(matches!(
+        initial.collect::<Result<Vec<_>, _>>()?.as_slice(),
+        [Delta::Addition(_)]
+    ));
+
+    store.remove(&first)?;
+    let QueryResultsDelta::Solutions(unchanged) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    assert_eq!(unchanged.count(), 0);
+
+    store.remove(&second)?;
+    let QueryResultsDelta::Solutions(deleted) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    assert!(matches!(
+        deleted.collect::<Result<Vec<_>, _>>()?.as_slice(),
+        [Delta::Deletion(_)]
+    ));
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "rdf-12")]
+fn incremental_rdf_star_variable_triple_pattern() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let link = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:r"),
+        GraphName::DefaultGraph,
+    );
+    let reification = Quad::new(
+        NamedNode::new_unchecked("urn:r"),
+        rdf::REIFIES,
+        Triple::new(
+            NamedNode::new_unchecked("urn:a"),
+            NamedNode::new_unchecked("urn:q"),
+            NamedNode::new_unchecked("urn:z"),
+        ),
+        GraphName::DefaultGraph,
+    );
+    store.insert(link)?;
+    store.insert(reification.clone())?;
+    let mut query = SparqlEvaluator::new()
+        .parse_query("SELECT ?x WHERE { <urn:s> <urn:p> << ?x <urn:q> <urn:z> >> }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let QueryResultsDelta::Solutions(initial) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    assert!(matches!(
+        initial.collect::<Result<Vec<_>, _>>()?.as_slice(),
+        [Delta::Addition(row)] if row.get("x") == Some(&NamedNode::new_unchecked("urn:a").into())
+    ));
+
+    store.remove(&reification)?;
+    let QueryResultsDelta::Solutions(deleted) = query.deltas()? else {
+        unreachable!("expected SELECT deltas")
+    };
+    assert!(matches!(
+        deleted.collect::<Result<Vec<_>, _>>()?.as_slice(),
+        [Delta::Deletion(_)]
+    ));
+    Ok(())
+}
+
+#[test]
+fn incremental_union_default_graph_matches_reevaluation() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let left = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    let right = |graph: &'static str, value: &'static str| {
+        Quad::new(
+            NamedNode::new_unchecked("urn:o"),
+            NamedNode::new_unchecked("urn:q"),
+            NamedNode::new_unchecked(value),
+            NamedNode::new_unchecked(graph),
+        )
+    };
+    let first = right("urn:g1", "urn:v1");
+    let duplicate = right("urn:g2", "urn:v1");
+    let second = right("urn:g3", "urn:v2");
+    store.insert(left.clone())?;
+    store.insert(first.clone())?;
+    store.insert(duplicate.clone())?;
+    store.insert(second)?;
+
+    // Projection must keep two copies of ?s, but graph merging must not count
+    // the identical (o, q, v1) triple twice.
+    let mut prepared =
+        SparqlEvaluator::new().parse_query("SELECT ?s WHERE { ?s <urn:p> ?o . ?o <urn:q> ?v }")?;
+    prepared.dataset_mut().set_default_graph_as_union();
+    let mut state = prepared
+        .clone()
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let mut assert_results = |expected_count| -> Result<(), Box<dyn Error>> {
+        let IncrementalQueryResults::Solutions(incremental) = state.results()? else {
+            unreachable!("expected SELECT results")
+        };
+        let incremental = incremental
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        let QueryResults::Solutions(reevaluated) = prepared.clone().on_store(&store).execute()?
+        else {
+            unreachable!("expected SELECT results")
+        };
+        let reevaluated = reevaluated
+            .map(|row| row.map(|row| row.values().to_vec()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(reevaluated.len(), expected_count);
+        assert_eq!(incremental, reevaluated);
+        Ok(())
+    };
+    assert_results(2)?;
+
+    // A graph created after subscription must participate in the union.
+    let later_duplicate = right("urn:new-graph", "urn:v1");
+    store.insert(later_duplicate.clone())?;
+    assert_results(2)?;
+    store.insert(right("urn:g1", "urn:v3"))?;
+    assert_results(3)?;
+    store.remove(&first)?;
+    store.remove(&duplicate)?;
+    assert_results(3)?;
+    store.remove(&later_duplicate)?;
+    assert_results(2)?;
+    store.remove(&left)?;
+    assert_results(0)?;
     Ok(())
 }
 

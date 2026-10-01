@@ -1,5 +1,5 @@
-use crate::Delta;
-use crate::eval::{IncrementalQueryNotifier, StreamingItem};
+use crate::eval::IncrementalQueryNotifier;
+use crate::{Delta, QueryEvaluationError};
 #[cfg(feature = "sparql-12")]
 use oxrdf::BaseDirection;
 use oxrdf::{
@@ -20,6 +20,7 @@ use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::iter::empty;
 use std::mem::discriminant;
+use std::rc::Rc;
 use std::sync::Weak;
 
 /// A [RDF dataset](https://www.w3.org/TR/sparql11-query/#rdfDataset) that can be queried using SPARQL
@@ -153,21 +154,68 @@ pub trait QueryableDataset<'a>: Sized + 'a {
     }
 }
 
-/// A dataset that can expose quad-pattern matches as deltas.
+/// A push-oriented source of an atomic initial snapshot and subsequent commit batches.
+/// The source is owned by one incremental query, not by a query operator.
+pub trait IncrementalQuadSource<T, E> {
+    fn snapshot(
+        &mut self,
+        emit: &mut dyn FnMut(InternalQuad<T>) -> Result<(), QueryEvaluationError>,
+    ) -> Result<(), QueryEvaluationError>;
+    fn next_batch(&mut self) -> Result<Option<Vec<Delta<InternalQuad<T>>>>, E>;
+    fn is_live(&self) -> bool;
+}
+
+struct StaticQuadSource<'a, D: QueryableDataset<'a>> {
+    dataset: Rc<D>,
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, D: QueryableDataset<'a>> IncrementalQuadSource<D::InternalTerm, D::Error>
+    for StaticQuadSource<'a, D>
+{
+    fn snapshot(
+        &mut self,
+        emit: &mut dyn FnMut(InternalQuad<D::InternalTerm>) -> Result<(), QueryEvaluationError>,
+    ) -> Result<(), QueryEvaluationError> {
+        // The existing read-only dataset API remains iterator based for ordinary evaluation.
+        // Incremental evaluation crosses this boundary once, by pushing its snapshot into input.
+        for quad in self
+            .dataset
+            .internal_quads_for_pattern(None, None, None, Some(None))
+        {
+            emit(quad.map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))?)?;
+        }
+        for quad in self
+            .dataset
+            .internal_quads_for_pattern(None, None, None, None)
+        {
+            emit(quad.map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))?)?;
+        }
+        Ok(())
+    }
+
+    fn next_batch(
+        &mut self,
+    ) -> Result<Option<Vec<Delta<InternalQuad<D::InternalTerm>>>>, D::Error> {
+        Ok(None)
+    }
+
+    fn is_live(&self) -> bool {
+        false
+    }
+}
+
+/// A dataset that can feed one query-wide differential dataflow.
 pub trait IncrementalQueryableDataset<'a>: QueryableDataset<'a> {
-    fn internal_quad_deltas_for_pattern(
-        &self,
-        subject: Option<&Self::InternalTerm>,
-        predicate: Option<&Self::InternalTerm>,
-        object: Option<&Self::InternalTerm>,
-        graph_name: Option<Option<&Self::InternalTerm>>,
+    fn incremental_quad_source(
+        self: Rc<Self>,
         notifier: Weak<IncrementalQueryNotifier>,
-    ) -> impl Iterator<
-        Item = Result<StreamingItem<Delta<InternalQuad<Self::InternalTerm>>>, Self::Error>,
-    > + use<'a, Self> {
+    ) -> Box<dyn IncrementalQuadSource<Self::InternalTerm, Self::Error> + 'a> {
         drop(notifier);
-        self.internal_quads_for_pattern(subject, predicate, object, graph_name)
-            .map(|quad| quad.map(Delta::addition).map(StreamingItem::Item))
+        Box::new(StaticQuadSource {
+            dataset: self,
+            _lifetime: std::marker::PhantomData,
+        })
     }
 }
 

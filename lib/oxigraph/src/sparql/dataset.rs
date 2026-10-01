@@ -3,20 +3,21 @@ use crate::storage::numeric_encoder::{
     Decoder, EncodedQuad, EncodedTerm, EncodedTriple, StrHash, StrHashHasher, StrLookup,
     insert_term,
 };
-use crate::storage::{CorruptionError, DecodingQuadIterator, StorageError, StorageReader};
+use crate::storage::{CorruptionError, StorageError, StorageReader};
 use oxsdatatypes::Boolean;
 use oxstr::OxString;
 #[cfg(feature = "rdf-12")]
 use spareval::ExpressionTriple;
 use spareval::{
-    Delta, ExpressionTerm, IncrementalQueryNotifier, IncrementalQueryableDataset, InternalQuad,
-    InternalTriple, QueryableDataset, StreamingItem,
+    Delta, ExpressionTerm, IncrementalQuadSource, IncrementalQueryNotifier,
+    IncrementalQueryableDataset, InternalQuad, InternalTriple, QueryEvaluationError,
+    QueryableDataset,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::vec_deque::IntoIter;
-use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
+use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
 pub struct DatasetView<'a> {
@@ -216,46 +217,24 @@ impl From<EncodedTriple> for InternalTriple<EncodedTerm> {
 }
 
 impl<'a> IncrementalQueryableDataset<'a> for DatasetView<'a> {
-    fn internal_quad_deltas_for_pattern(
-        &self,
-        subject: Option<&EncodedTerm>,
-        predicate: Option<&EncodedTerm>,
-        object: Option<&EncodedTerm>,
-        graph_name: Option<Option<&EncodedTerm>>,
+    fn incremental_quad_source(
+        self: Rc<Self>,
         notifier: Weak<IncrementalQueryNotifier>,
-    ) -> impl Iterator<Item = Result<StreamingItem<Delta<InternalQuad<EncodedTerm>>>, StorageError>>
-    + use<'a> {
-        Box::new(LiveQuadDeltaSource::new(
-            Arc::clone(&self.reader),
-            subject,
-            predicate,
-            object,
-            graph_name,
-            notifier,
-        ))
+    ) -> Box<dyn IncrementalQuadSource<EncodedTerm, StorageError> + 'a> {
+        Box::new(LiveQuadDeltaSource::new(Arc::clone(&self.reader), notifier))
     }
 }
 
 struct LiveQuadDeltaSource<'a> {
     reader: Arc<StorageReader<'a>>,
-    snapshot_iter: DecodingQuadIterator<'a>,
+    snapshot_reader: Arc<StorageReader<'a>>,
     subscription_id: Option<usize>,
-    snapshot_done: bool,
-    live_buffer: IntoIter<Delta<EncodedQuad>>,
 }
 
 impl<'a> LiveQuadDeltaSource<'a> {
-    fn new(
-        reader: Arc<StorageReader<'a>>,
-        subject: Option<&EncodedTerm>,
-        predicate: Option<&EncodedTerm>,
-        object: Option<&EncodedTerm>,
-        graph_name: Option<Option<&EncodedTerm>>,
-        notifier: Weak<IncrementalQueryNotifier>,
-    ) -> Self {
+    fn new(reader: Arc<StorageReader<'a>>, notifier: Weak<IncrementalQueryNotifier>) -> Self {
         let (subscription_id, reader) = if reader.can_refresh() {
-            let (subscription_id, fresh_reader) = reader
-                .subscribe_incremental_quads(subject, predicate, object, graph_name, notifier);
+            let (subscription_id, fresh_reader) = reader.subscribe_incremental_quads(notifier);
             (
                 Some(subscription_id),
                 fresh_reader.map(Arc::new).unwrap_or(reader),
@@ -265,18 +244,10 @@ impl<'a> LiveQuadDeltaSource<'a> {
             // committed-store notifications, which could duplicate or contradict its rows.
             (None, reader)
         };
-        let snapshot_iter = reader.quads_for_pattern(
-            subject,
-            predicate,
-            object,
-            graph_name.map(|graph_name| graph_name.unwrap_or(&EncodedTerm::DefaultGraph)),
-        );
         Self {
-            reader,
-            snapshot_iter,
+            reader: Arc::clone(&reader),
+            snapshot_reader: reader,
             subscription_id,
-            snapshot_done: false,
-            live_buffer: VecDeque::new().into_iter(),
         }
     }
 
@@ -288,37 +259,34 @@ impl<'a> LiveQuadDeltaSource<'a> {
             graph_name: (!quad.graph_name.is_default_graph()).then_some(quad.graph_name),
         }
     }
-
-    fn next_live_change(&mut self) -> Option<Delta<EncodedQuad>> {
-        if let Some(change) = self.live_buffer.next() {
-            return Some(change);
-        }
-        let subscription_id = self.subscription_id?;
-        self.live_buffer = self
-            .reader
-            .incremental_quad_subscription_changes(subscription_id)
-            .into_iter();
-        self.live_buffer.next()
-    }
 }
 
-impl Iterator for LiveQuadDeltaSource<'_> {
-    type Item = Result<StreamingItem<Delta<InternalQuad<EncodedTerm>>>, StorageError>;
+impl IncrementalQuadSource<EncodedTerm, StorageError> for LiveQuadDeltaSource<'_> {
+    fn snapshot(
+        &mut self,
+        emit: &mut dyn FnMut(InternalQuad<EncodedTerm>) -> Result<(), QueryEvaluationError>,
+    ) -> Result<(), QueryEvaluationError> {
+        self.snapshot_reader
+            .push_incremental_snapshot(&mut |quad| emit(Self::map_quad(quad)))
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if !self.snapshot_done {
-            if let Some(quad) = self.snapshot_iter.next() {
-                return Some(
-                    quad.map(Self::map_quad)
-                        .map(Delta::addition)
-                        .map(StreamingItem::Item),
-                );
-            }
-            self.snapshot_done = true;
-        }
-        self.next_live_change()
-            .map(|change| Ok(StreamingItem::Item(change.map(Self::map_quad))))
-            .or_else(|| self.subscription_id.map(|_| Ok(StreamingItem::Pending)))
+    fn next_batch(
+        &mut self,
+    ) -> Result<Option<Vec<Delta<InternalQuad<EncodedTerm>>>>, StorageError> {
+        Ok(self.subscription_id.and_then(|id| {
+            self.reader
+                .incremental_quad_subscription_changes(id)
+                .map(|batch| {
+                    batch
+                        .into_iter()
+                        .map(|delta| delta.map(Self::map_quad))
+                        .collect()
+                })
+        }))
+    }
+
+    fn is_live(&self) -> bool {
+        self.subscription_id.is_some()
     }
 }
 

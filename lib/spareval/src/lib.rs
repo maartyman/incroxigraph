@@ -16,7 +16,8 @@ mod update;
 #[cfg(feature = "sparql-12")]
 pub use crate::dataset::ExpressionTriple;
 pub use crate::dataset::{
-    ExpressionTerm, IncrementalQueryableDataset, InternalQuad, InternalTriple, QueryableDataset,
+    ExpressionTerm, IncrementalQuadSource, IncrementalQueryableDataset, InternalQuad,
+    InternalTriple, QueryableDataset,
 };
 pub use crate::delta_model::{
     Delta, DeltaKind, IncrementalGraphResults, IncrementalQueryDeltasIter,

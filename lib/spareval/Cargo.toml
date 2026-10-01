@@ -23,6 +23,7 @@ calendar-ext = [
 
 
 [dependencies]
+differential-dataflow.workspace = true
 hex.workspace = true
 json-event-parser.workspace = true
 md-5.workspace = true
@@ -33,6 +34,7 @@ oxstr.workspace = true
 rand.workspace = true
 regex.workspace = true
 rustc-hash.workspace = true
+serde = { workspace = true, features = ["derive"] }
 sha1.workspace = true
 sha2.workspace = true
 spargebra.workspace = true
@@ -40,6 +42,7 @@ spargeo = { workspace = true, optional = true }
 sparopt.workspace = true
 sparesults.workspace = true
 thiserror.workspace = true
+timely.workspace = true
 
 [lints]
 workspace = true
