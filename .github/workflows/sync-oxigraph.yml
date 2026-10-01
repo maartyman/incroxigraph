@@ -1,0 +1,63 @@
+name: Sync Oxigraph
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"
+      timezone: "Europe/Brussels"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Incroxigraph
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Oxigraph
+        run: |
+          git remote add upstream https://github.com/oxigraph/oxigraph.git
+          git fetch upstream main
+          git fetch origin main
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update sync branch
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          git push --force origin upstream/main:refs/heads/sync/oxigraph
+
+      - name: Create pull request
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_COUNT=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head sync/oxigraph \
+            --state open \
+            --json number \
+            --jq 'length')
+
+          if [ "$PR_COUNT" -eq 0 ]; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head sync/oxigraph \
+              --title "Sync changes from Oxigraph" \
+              --body "Automated PR to merge the latest changes from oxigraph/oxigraph."
+          fi

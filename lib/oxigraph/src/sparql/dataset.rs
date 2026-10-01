@@ -3,28 +3,31 @@ use crate::storage::numeric_encoder::{
     Decoder, EncodedQuad, EncodedTerm, EncodedTriple, StrHash, StrHashHasher, StrLookup,
     insert_term,
 };
-use crate::storage::{CorruptionError, StorageError, StorageReader};
+use crate::storage::{CorruptionError, DecodingQuadIterator, StorageError, StorageReader};
 use oxsdatatypes::Boolean;
 use oxstr::OxString;
 #[cfg(feature = "rdf-12")]
 use spareval::ExpressionTriple;
-use spareval::{ExpressionTerm, InternalQuad, InternalTriple, QueryableDataset};
+use spareval::{
+    Delta, ExpressionTerm, IncrementalQueryNotifier, IncrementalQueryableDataset, InternalQuad,
+    InternalTriple, QueryableDataset, StreamingItem,
+};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::vec_deque::IntoIter;
+use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasherDefault;
-#[cfg(feature = "rdf-12")]
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 pub struct DatasetView<'a> {
-    reader: StorageReader<'a>,
+    reader: Arc<StorageReader<'a>>,
     extra: RefCell<HashMap<StrHash, OxString, BuildHasherDefault<StrHashHasher>>>,
 }
 
 impl<'a> DatasetView<'a> {
     pub fn new(reader: StorageReader<'a>) -> Self {
         Self {
-            reader,
+            reader: Arc::new(reader),
             extra: RefCell::new(HashMap::default()),
         }
     }
@@ -208,6 +211,121 @@ impl From<EncodedTriple> for InternalTriple<EncodedTerm> {
             subject: triple.subject,
             predicate: triple.predicate,
             object: triple.object,
+        }
+    }
+}
+
+impl<'a> IncrementalQueryableDataset<'a> for DatasetView<'a> {
+    fn internal_quad_deltas_for_pattern(
+        &self,
+        subject: Option<&EncodedTerm>,
+        predicate: Option<&EncodedTerm>,
+        object: Option<&EncodedTerm>,
+        graph_name: Option<Option<&EncodedTerm>>,
+        notifier: Weak<IncrementalQueryNotifier>,
+    ) -> impl Iterator<Item = Result<StreamingItem<Delta<InternalQuad<EncodedTerm>>>, StorageError>>
+    + use<'a> {
+        Box::new(LiveQuadDeltaSource::new(
+            Arc::clone(&self.reader),
+            subject,
+            predicate,
+            object,
+            graph_name,
+            notifier,
+        ))
+    }
+}
+
+struct LiveQuadDeltaSource<'a> {
+    reader: Arc<StorageReader<'a>>,
+    snapshot_iter: DecodingQuadIterator<'a>,
+    subscription_id: Option<usize>,
+    snapshot_done: bool,
+    live_buffer: IntoIter<Delta<EncodedQuad>>,
+}
+
+impl<'a> LiveQuadDeltaSource<'a> {
+    fn new(
+        reader: Arc<StorageReader<'a>>,
+        subject: Option<&EncodedTerm>,
+        predicate: Option<&EncodedTerm>,
+        object: Option<&EncodedTerm>,
+        graph_name: Option<Option<&EncodedTerm>>,
+        notifier: Weak<IncrementalQueryNotifier>,
+    ) -> Self {
+        let (subscription_id, reader) = if reader.can_refresh() {
+            let (subscription_id, fresh_reader) = reader
+                .subscribe_incremental_quads(subject, predicate, object, graph_name, notifier);
+            (
+                Some(subscription_id),
+                fresh_reader.map(Arc::new).unwrap_or(reader),
+            )
+        } else {
+            // A transaction reader is an isolated snapshot. It must not be combined with
+            // committed-store notifications, which could duplicate or contradict its rows.
+            (None, reader)
+        };
+        let snapshot_iter = reader.quads_for_pattern(
+            subject,
+            predicate,
+            object,
+            graph_name.map(|graph_name| graph_name.unwrap_or(&EncodedTerm::DefaultGraph)),
+        );
+        Self {
+            reader,
+            snapshot_iter,
+            subscription_id,
+            snapshot_done: false,
+            live_buffer: VecDeque::new().into_iter(),
+        }
+    }
+
+    fn map_quad(quad: EncodedQuad) -> InternalQuad<EncodedTerm> {
+        InternalQuad {
+            subject: quad.subject,
+            predicate: quad.predicate,
+            object: quad.object,
+            graph_name: (!quad.graph_name.is_default_graph()).then_some(quad.graph_name),
+        }
+    }
+
+    fn next_live_change(&mut self) -> Option<Delta<EncodedQuad>> {
+        if let Some(change) = self.live_buffer.next() {
+            return Some(change);
+        }
+        let subscription_id = self.subscription_id?;
+        self.live_buffer = self
+            .reader
+            .incremental_quad_subscription_changes(subscription_id)
+            .into_iter();
+        self.live_buffer.next()
+    }
+}
+
+impl Iterator for LiveQuadDeltaSource<'_> {
+    type Item = Result<StreamingItem<Delta<InternalQuad<EncodedTerm>>>, StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.snapshot_done {
+            if let Some(quad) = self.snapshot_iter.next() {
+                return Some(
+                    quad.map(Self::map_quad)
+                        .map(Delta::addition)
+                        .map(StreamingItem::Item),
+                );
+            }
+            self.snapshot_done = true;
+        }
+        self.next_live_change()
+            .map(|change| Ok(StreamingItem::Item(change.map(Self::map_quad))))
+            .or_else(|| self.subscription_id.map(|_| Ok(StreamingItem::Pending)))
+    }
+}
+
+impl Drop for LiveQuadDeltaSource<'_> {
+    fn drop(&mut self) {
+        if let Some(subscription_id) = self.subscription_id {
+            self.reader.unsubscribe_incremental_quads(subscription_id);
         }
     }
 }
