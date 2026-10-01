@@ -1027,3 +1027,35 @@ impl Drop for DirSaver {
         }
     }
 }
+
+#[test]
+fn test_snapshot_is_pinned_to_one_state() -> Result<(), Box<dyn Error>> {
+    let ex = NamedNode::new("http://example.com")?;
+    let q1 = Quad::new(ex.clone(), ex.clone(), ex.clone(), GraphName::DefaultGraph);
+    let q2 = Quad::new(ex.clone(), ex.clone(), ex.clone(), ex.clone());
+    let store = Store::new()?;
+    store.insert(q1.clone())?;
+
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.len()?, 1);
+    assert!(!snapshot.is_empty()?);
+    assert!(snapshot.contains(&q1)?);
+
+    // Committed after the snapshot was taken, so the snapshot must not see it
+    // while the store must.
+    store.insert(q2.clone())?;
+    assert_eq!(snapshot.len()?, 1);
+    assert_eq!(store.len()?, 2);
+    assert!(!snapshot.contains(&q2)?);
+    assert!(store.contains(&q2)?);
+
+    // The same state through every accessor, not just len.
+    assert_eq!(snapshot.iter().count(), 1);
+    assert_eq!(
+        snapshot
+            .quads_for_pattern(None, Some(&ex), None, None)
+            .count(),
+        1
+    );
+    Ok(())
+}

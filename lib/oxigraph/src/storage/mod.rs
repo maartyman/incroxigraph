@@ -425,6 +425,7 @@ fn notify_incremental_changes(
     }
 }
 
+#[derive(Clone)]
 #[must_use]
 pub struct StorageReader<'a> {
     kind: StorageReaderKind<'a>,
@@ -433,6 +434,7 @@ pub struct StorageReader<'a> {
     can_refresh: bool,
 }
 
+#[derive(Clone)]
 enum StorageReaderKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbStorageReader<'a>),

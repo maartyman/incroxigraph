@@ -242,16 +242,8 @@ impl Store {
         object: Option<&Term>,
         graph_name: Option<&GraphName>,
     ) -> QuadIter<'static> {
-        let reader = self.storage.snapshot();
-        QuadIter {
-            iter: reader.quads_for_pattern(
-                subject.map(EncodedTerm::from).as_ref(),
-                predicate.map(EncodedTerm::from).as_ref(),
-                object.map(EncodedTerm::from).as_ref(),
-                graph_name.map(EncodedTerm::from).as_ref(),
-            ),
-            reader,
-        }
+        self.snapshot()
+            .quads_for_pattern(subject, predicate, object, graph_name)
     }
 
     /// Returns all the quads contained in the store.
@@ -295,8 +287,7 @@ impl Store {
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
     pub fn contains(&self, quad: &Quad) -> Result<bool, StorageError> {
-        let quad = EncodedQuad::from(quad);
-        self.storage.snapshot().contains(&quad)
+        self.snapshot().contains(quad)
     }
 
     /// Returns the number of quads in the store.
@@ -321,7 +312,7 @@ impl Store {
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
     pub fn len(&self) -> Result<usize, StorageError> {
-        self.storage.snapshot().len()
+        self.snapshot().len()
     }
 
     /// Returns if the store is empty.
@@ -340,7 +331,44 @@ impl Store {
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
     pub fn is_empty(&self) -> Result<bool, StorageError> {
-        self.storage.snapshot().is_empty()
+        self.snapshot().is_empty()
+    }
+
+    /// Takes a snapshot of the store: a read view pinned to the state at this instant.
+    ///
+    /// Each read method of [`Store`] (`len`, `contains`, `quads_for_pattern`...)
+    /// works on its own snapshot, so two successive calls may observe two
+    /// different states. A [`Snapshot`] holds a single state across as many
+    /// reads as needed.
+    ///
+    /// Unlike [`Store::start_transaction`], a snapshot holds no lock, so writers
+    /// are never blocked while it is alive. It cannot be written through.
+    ///
+    /// Usage example:
+    /// ```
+    /// use oxigraph::model::*;
+    /// use oxigraph::store::Store;
+    ///
+    /// let ex = NamedNode::new("http://example.com")?;
+    /// let store = Store::new()?;
+    /// store.insert(Quad::new(
+    ///     ex.clone(),
+    ///     ex.clone(),
+    ///     ex.clone(),
+    ///     GraphName::DefaultGraph,
+    /// ))?;
+    ///
+    /// let snapshot = store.snapshot();
+    /// // committed after the snapshot was taken
+    /// store.insert(Quad::new(ex.clone(), ex.clone(), ex.clone(), ex.clone()))?;
+    /// assert_eq!(snapshot.len()?, 1); // not visible through the snapshot
+    /// assert_eq!(store.len()?, 2);
+    /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
+    /// ```
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            reader: self.storage.snapshot(),
+        }
     }
 
     /// Start a transaction.
@@ -853,6 +881,73 @@ impl fmt::Display for Store {
 }
 
 impl IntoIterator for &Store {
+    type IntoIter = QuadIter<'static>;
+    type Item = Result<Quad, StorageError>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// A read-only view of a [`Store`] pinned to a single state.
+///
+/// Returned by [`Store::snapshot`]. Every read sees the state the store was in
+/// when the snapshot was taken, whatever has been committed since. It holds no
+/// lock, so writers are not blocked while it is alive.
+#[derive(Clone)]
+#[must_use]
+pub struct Snapshot {
+    reader: StorageReader<'static>,
+}
+
+impl Snapshot {
+    /// Retrieves quads with a filter on each quad component.
+    ///
+    /// See [`Store::quads_for_pattern`].
+    pub fn quads_for_pattern(
+        &self,
+        subject: Option<&NamedOrBlankNode>,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+        graph_name: Option<&GraphName>,
+    ) -> QuadIter<'static> {
+        QuadIter {
+            iter: self.reader.quads_for_pattern(
+                subject.map(EncodedTerm::from).as_ref(),
+                predicate.map(EncodedTerm::from).as_ref(),
+                object.map(EncodedTerm::from).as_ref(),
+                graph_name.map(EncodedTerm::from).as_ref(),
+            ),
+            reader: self.reader.clone(),
+        }
+    }
+
+    /// Returns all the quads contained in the snapshot.
+    pub fn iter(&self) -> QuadIter<'static> {
+        self.quads_for_pattern(None, None, None, None)
+    }
+
+    /// Checks if this snapshot contains a given quad.
+    pub fn contains(&self, quad: &Quad) -> Result<bool, StorageError> {
+        let quad = EncodedQuad::from(quad);
+        self.reader.contains(&quad)
+    }
+
+    /// Returns the number of quads in the snapshot.
+    ///
+    /// <div class="warning">This function executes a full scan.</div>
+    pub fn len(&self) -> Result<usize, StorageError> {
+        self.reader.len()
+    }
+
+    /// Returns if the snapshot is empty.
+    pub fn is_empty(&self) -> Result<bool, StorageError> {
+        self.reader.is_empty()
+    }
+}
+
+impl IntoIterator for &Snapshot {
     type IntoIter = QuadIter<'static>;
     type Item = Result<Quad, StorageError>;
 
