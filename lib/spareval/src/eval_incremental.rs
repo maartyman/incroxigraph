@@ -744,14 +744,10 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                         if keys.is_empty() {
                             Rc::new(move |from| {
                                 Box::new(SymmetricNestedLoopJoinIterator {
-                                    left_iter: left(from.clone()),
-                                    right_iter: right(from),
+                                    inputs: JoinInputs::new(left(from.clone()), right(from)),
                                     left_values: Vec::new(),
                                     right_values: Vec::new(),
                                     buffered_results: Vec::new(),
-                                    left_done: false,
-                                    right_done: false,
-                                    active_side: JoinSide::Left,
                                 })
                             })
                         } else {
@@ -767,15 +763,10 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
                                 left_values.reserve(left_iter.size_hint().0);
                                 right_values.reserve(right_iter.size_hint().0);
                                 Box::new(SymmetricHashJoinIterator {
-                                    left_iter,
-                                    right_iter,
+                                    inputs: JoinInputs::new(left_iter, right_iter),
                                     left_values,
                                     right_values,
-                                    pending_values: Vec::new(),
                                     buffered_results: Vec::new(),
-                                    left_done: false,
-                                    right_done: false,
-                                    active_side: JoinSide::Left,
                                 })
                             })
                         }
@@ -972,16 +963,111 @@ impl<'a, D: IncrementalQueryableDataset<'a>> IncrementalSelectDriver<'a, D> {
     }
 }
 
-struct SymmetricHashJoinIterator<'a, T> {
-    left_iter: InternalTupleDeltasIterator<'a, T>,
-    right_iter: InternalTupleDeltasIterator<'a, T>,
-    left_values: InternalTupleSet<T>,
-    right_values: InternalTupleSet<T>,
-    pending_values: Vec<(u64, Delta<InternalTuple<T>>)>,
-    buffered_results: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
+type JoinInputItem<T> =
+    Result<StreamingItem<(JoinSide, Delta<InternalTuple<T>>)>, QueryEvaluationError>;
+
+struct JoinInputs<'a, T> {
+    left: InternalTupleDeltasIterator<'a, T>,
+    right: InternalTupleDeltasIterator<'a, T>,
     left_done: bool,
     right_done: bool,
-    active_side: JoinSide,
+    next_side: JoinSide,
+    staged: Option<(JoinSide, Delta<InternalTuple<T>>)>,
+}
+
+impl<'a, T> JoinInputs<'a, T> {
+    fn new(
+        left: InternalTupleDeltasIterator<'a, T>,
+        right: InternalTupleDeltasIterator<'a, T>,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            left_done: false,
+            right_done: false,
+            next_side: JoinSide::Left,
+            staged: None,
+        }
+    }
+
+    fn poll_side(&mut self, side: JoinSide) -> Option<JoinInputItem<T>> {
+        let (iter, done) = match side {
+            JoinSide::Left => (&mut self.left, &mut self.left_done),
+            JoinSide::Right => (&mut self.right, &mut self.right_done),
+        };
+        if *done {
+            return None;
+        }
+        match iter.next() {
+            Some(Ok(StreamingItem::Item(delta))) => Some(Ok(StreamingItem::Item((side, delta)))),
+            Some(Ok(StreamingItem::Pending)) => Some(Ok(StreamingItem::Pending)),
+            Some(Err(error)) => Some(Err(error)),
+            None => {
+                *done = true;
+                None
+            }
+        }
+    }
+
+    fn next(&mut self, left_empty: bool, right_empty: bool) -> Option<JoinInputItem<T>> {
+        if (self.left_done && left_empty)
+            || (self.right_done && right_empty)
+            || (self.left_done && self.right_done)
+        {
+            return None;
+        }
+
+        if let Some(side) = self.staged.as_ref().map(|(side, _)| *side) {
+            // A tuple from the formerly empty side must see all earlier
+            // changes on the deferred side before it can produce matches.
+            match self.poll_side(side.other()) {
+                Some(Ok(StreamingItem::Item(item))) => {
+                    return Some(Ok(StreamingItem::Item(item)));
+                }
+                Some(Err(error)) => return Some(Err(error)),
+                Some(Ok(StreamingItem::Pending)) | None => {
+                    return Some(Ok(StreamingItem::Item(self.staged.take().unwrap())));
+                }
+            }
+        }
+
+        if left_empty || right_empty {
+            let side = if left_empty {
+                JoinSide::Left
+            } else {
+                JoinSide::Right
+            };
+            match self.poll_side(side) {
+                Some(Ok(StreamingItem::Item(item))) => {
+                    self.staged = Some(item);
+                    return self.next(left_empty, right_empty);
+                }
+                Some(other) => return Some(other),
+                None => return None,
+            }
+        }
+
+        let side = self.next_side;
+        self.next_side = side.other();
+        match self.poll_side(side) {
+            Some(Ok(StreamingItem::Item(item))) => return Some(Ok(StreamingItem::Item(item))),
+            Some(Err(error)) => return Some(Err(error)),
+            Some(Ok(StreamingItem::Pending)) | None => {}
+        }
+        match self.poll_side(side.other()) {
+            Some(Ok(StreamingItem::Item(item))) => Some(Ok(StreamingItem::Item(item))),
+            Some(Err(error)) => Some(Err(error)),
+            Some(Ok(StreamingItem::Pending)) | None if self.left_done && self.right_done => None,
+            Some(Ok(StreamingItem::Pending)) | None => Some(Ok(StreamingItem::Pending)),
+        }
+    }
+}
+
+struct SymmetricHashJoinIterator<'a, T> {
+    inputs: JoinInputs<'a, T>,
+    left_values: InternalTupleSet<T>,
+    right_values: InternalTupleSet<T>,
+    buffered_results: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
 }
 
 impl<T: Clone + Eq + Hash> Iterator for SymmetricHashJoinIterator<'_, T> {
@@ -992,102 +1078,49 @@ impl<T: Clone + Eq + Hash> Iterator for SymmetricHashJoinIterator<'_, T> {
             if let Some(result) = self.buffered_results.pop() {
                 return Some(result);
             }
-            if self.left_done && self.right_done {
-                return None;
-            }
-
-            let first_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
-            }
-
-            self.active_side = self.active_side.other();
-            let second_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
-            }
-
-            if self.left_done && self.right_done {
-                return None;
-            }
-            if matches!(first_state, PollState::Pending | PollState::Done)
-                && matches!(second_state, PollState::Pending | PollState::Done)
+            match self
+                .inputs
+                .next(self.left_values.len == 0, self.right_values.len == 0)?
             {
-                return Some(Ok(StreamingItem::Pending));
+                Ok(StreamingItem::Item((side, delta))) => {
+                    if let Err(error) = self.process_delta(side, delta) {
+                        return Some(Err(error));
+                    }
+                }
+                Ok(StreamingItem::Pending) => return Some(Ok(StreamingItem::Pending)),
+                Err(error) => return Some(Err(error)),
             }
         }
     }
 }
 
 impl<T: Clone + Eq + Hash> SymmetricHashJoinIterator<'_, T> {
-    fn poll_active_side(&mut self) -> PollState {
-        let (iter, values, other_values, done) = match self.active_side {
-            JoinSide::Left => (
-                &mut self.left_iter,
-                &mut self.left_values,
-                &self.right_values,
-                &mut self.left_done,
-            ),
-            JoinSide::Right => (
-                &mut self.right_iter,
-                &mut self.right_values,
-                &self.left_values,
-                &mut self.right_done,
-            ),
+    fn process_delta(
+        &mut self,
+        side: JoinSide,
+        delta: Delta<InternalTuple<T>>,
+    ) -> Result<(), QueryEvaluationError> {
+        let (values, other_values) = match side {
+            JoinSide::Left => (&mut self.left_values, &self.right_values),
+            JoinSide::Right => (&mut self.right_values, &self.left_values),
         };
-        if *done {
-            return PollState::Done;
-        }
-
-        while self.buffered_results.is_empty() {
-            match iter.next() {
-                Some(Ok(StreamingItem::Item(delta))) => {
-                    let key = other_values.tuple_key(delta.value());
-                    let kind = delta.kind();
-                    self.buffered_results.extend(
-                        other_values
-                            .get(key)
-                            .iter()
-                            .filter_map(|other| delta.value().combine_with(other))
-                            .map(move |joined| {
-                                Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
-                            }),
-                    );
-                    self.pending_values.push((key, delta));
-                }
-                Some(Ok(StreamingItem::Pending)) => break,
-                Some(Err(error)) => {
-                    self.buffered_results.push(Err(error));
-                    break;
-                }
-                None => {
-                    *done = true;
-                    break;
-                }
+        let key = values.tuple_key(delta.value());
+        let kind = delta.kind();
+        self.buffered_results.extend(
+            other_values
+                .get(key)
+                .iter()
+                .filter_map(|other| delta.value().combine_with(other))
+                .map(move |joined| Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))),
+        );
+        match delta {
+            Delta::Addition(tuple) => values.insert(key, tuple),
+            Delta::Deletion(tuple) if !values.remove_one(key, &tuple) => {
+                return Err(non_existing_tuple_deleted());
             }
+            Delta::Deletion(_) => {}
         }
-
-        values.reserve(self.pending_values.len());
-        for (key, delta) in self.pending_values.drain(..) {
-            match delta {
-                Delta::Addition(tuple) => values.insert(key, tuple),
-                Delta::Deletion(tuple) if !values.remove_one(key, &tuple) => {
-                    self.buffered_results
-                        .push(Err(non_existing_tuple_deleted()));
-                }
-                Delta::Deletion(_) => {}
-            }
-        }
-
-        if self.buffered_results.is_empty() {
-            if *done {
-                PollState::Done
-            } else {
-                PollState::Pending
-            }
-        } else {
-            PollState::Item
-        }
+        Ok(())
     }
 }
 
@@ -1107,87 +1140,42 @@ impl JoinSide {
 }
 
 struct SymmetricNestedLoopJoinIterator<'a, T> {
-    left_iter: InternalTupleDeltasIterator<'a, T>,
-    right_iter: InternalTupleDeltasIterator<'a, T>,
+    inputs: JoinInputs<'a, T>,
     left_values: Vec<InternalTuple<T>>,
     right_values: Vec<InternalTuple<T>>,
     buffered_results: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
-    left_done: bool,
-    right_done: bool,
-    active_side: JoinSide,
 }
 
 impl<T: Clone + Eq> SymmetricNestedLoopJoinIterator<'_, T> {
-    fn poll_active_side(&mut self) -> PollState {
-        let active_side = self.active_side;
-        let (iter, values, other_values, done) = match active_side {
-            JoinSide::Left => (
-                &mut self.left_iter,
-                &mut self.left_values,
-                &self.right_values,
-                &mut self.left_done,
-            ),
-            JoinSide::Right => (
-                &mut self.right_iter,
-                &mut self.right_values,
-                &self.left_values,
-                &mut self.right_done,
-            ),
+    fn process_delta(&mut self, side: JoinSide, delta: Delta<InternalTuple<T>>) {
+        let (values, other_values) = match side {
+            JoinSide::Left => (&mut self.left_values, &self.right_values),
+            JoinSide::Right => (&mut self.right_values, &self.left_values),
         };
-        if *done {
-            return PollState::Done;
-        }
-
-        while self.buffered_results.is_empty() {
-            match iter.next() {
-                Some(Ok(StreamingItem::Item(delta))) => {
-                    let (kind, tuple) = delta.into_parts();
-                    let joined = |other: &InternalTuple<T>| match active_side {
-                        JoinSide::Left => tuple.combine_with(other),
-                        JoinSide::Right => other.combine_with(&tuple),
-                    };
-                    match kind {
-                        DeltaKind::Addition => {
-                            self.buffered_results.extend(
-                                other_values.iter().filter_map(joined).map(move |joined| {
-                                    Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
-                                }),
-                            );
-                            values.push(tuple);
-                        }
-                        DeltaKind::Deletion => {
-                            if let Some(position) = values.iter().position(|value| value == &tuple)
-                            {
-                                values.swap_remove(position);
-                                self.buffered_results.extend(
-                                    other_values.iter().filter_map(joined).map(move |joined| {
-                                        Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                }
-                Some(Ok(StreamingItem::Pending)) => break,
-                Some(Err(error)) => {
-                    self.buffered_results.push(Err(error));
-                    break;
-                }
-                None => {
-                    *done = true;
-                    break;
+        let (kind, tuple) = delta.into_parts();
+        let joined = |other: &InternalTuple<T>| match side {
+            JoinSide::Left => tuple.combine_with(other),
+            JoinSide::Right => other.combine_with(&tuple),
+        };
+        match kind {
+            DeltaKind::Addition => {
+                self.buffered_results.extend(
+                    other_values
+                        .iter()
+                        .filter_map(joined)
+                        .map(move |joined| Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))),
+                );
+                values.push(tuple);
+            }
+            DeltaKind::Deletion => {
+                if let Some(position) = values.iter().position(|value| value == &tuple) {
+                    values.swap_remove(position);
+                    self.buffered_results
+                        .extend(other_values.iter().filter_map(joined).map(move |joined| {
+                            Ok(StreamingItem::Item(Delta::with_kind(kind, joined)))
+                        }));
                 }
             }
-        }
-
-        if self.buffered_results.is_empty() {
-            if *done {
-                PollState::Done
-            } else {
-                PollState::Pending
-            }
-        } else {
-            PollState::Item
         }
     }
 }
@@ -1200,37 +1188,16 @@ impl<T: Clone + Eq> Iterator for SymmetricNestedLoopJoinIterator<'_, T> {
             if let Some(result) = self.buffered_results.pop() {
                 return Some(result);
             }
-            if self.left_done && self.right_done {
-                return None;
-            }
-
-            let first_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
-            }
-
-            self.active_side = self.active_side.other();
-            let second_state = self.poll_active_side();
-            if let Some(result) = self.buffered_results.pop() {
-                return Some(result);
-            }
-
-            if self.left_done && self.right_done {
-                return None;
-            }
-            if matches!(first_state, PollState::Pending | PollState::Done)
-                && matches!(second_state, PollState::Pending | PollState::Done)
+            match self
+                .inputs
+                .next(self.left_values.is_empty(), self.right_values.is_empty())?
             {
-                return Some(Ok(StreamingItem::Pending));
+                Ok(StreamingItem::Item((side, delta))) => self.process_delta(side, delta),
+                Ok(StreamingItem::Pending) => return Some(Ok(StreamingItem::Pending)),
+                Err(error) => return Some(Err(error)),
             }
         }
     }
-}
-
-enum PollState {
-    Item,
-    Pending,
-    Done,
 }
 
 struct InternalTupleSet<T> {
