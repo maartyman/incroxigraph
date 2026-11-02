@@ -7,18 +7,31 @@ on:
       timezone: "Europe/Brussels"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
+      # Syncing upstream also updates .github/workflows/, which GITHUB_TOKEN cannot do.
+      # Add the OXIGRAPH_SYNC_TOKEN repository Actions secret with a fine-grained PAT
+      # limited to this repository, granting Contents, Pull requests, and Workflows
+      # read and write access.
+      - name: Check sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.OXIGRAPH_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Missing OXIGRAPH_SYNC_TOKEN repository secret. See the setup comments in .github/workflows/sync-oxigraph.yml."
+            exit 1
+          fi
+
       - name: Checkout Incroxigraph
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          token: ${{ secrets.OXIGRAPH_SYNC_TOKEN }}
 
       - name: Fetch Oxigraph
         run: |
@@ -43,7 +56,7 @@ jobs:
       - name: Create pull request
         if: steps.check.outputs.needed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.OXIGRAPH_SYNC_TOKEN }}
         run: |
           PR_COUNT=$(gh pr list \
             --repo "$GITHUB_REPOSITORY" \
