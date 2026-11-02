@@ -24,9 +24,12 @@
     :values_in_filter_not_exists
     :subquery_in_filter_not_exists
     :cmp_langString
+    :is_numeric_derived_integer_range
+    :eq_dirLangString
     :nested_path
     :nested_expression
     :order_terms
+    :cast_string_whitespace
     :nested_anonymous
     :unbound_variable_in_subquery
     :one_or_more_shared
@@ -34,6 +37,20 @@
     :in_empty_error
     :small_iri_str
     :construct_semicolon_dot
+    :construct_property_path
+    :construct_nested_property_path
+    :construct_parenthesized_predicate
+    :insert_data_parenthesized_predicate
+    :insert_data_trailing_reifier
+    :delete_collection
+    :delete_nested_blank_node
+    :delete_implicit_reifier
+    :insert_data_triple_subject
+    :insert_data_nested_literal_subject
+    :insert_data_nested_variable
+    :delete_data_nested_blank_node
+    :delete_data_nested_variable
+    :delete_data_triple_subject
     :regex_variable
     :ask_union_error_left
     :ask_union_error_right
@@ -48,16 +65,31 @@
     :merged_default_graph_update
     :delete_insert_solution_order
     :repeated_blank_node
+    :arithmetic_left_associative
+    :arithmetic_signed_literal
+    :graph_minus_graph_variable
+    :pname_local_escape
     ) .
+
+:eq_dirLangString rdf:type mf:QueryEvaluationTest ;
+    mf:name "Directional language literal equality compares value, language and direction" ;
+    mf:action [ qt:query <eq_dirLangString.rq> ; qt:data <eq_dirLangString.ttl> ] ;
+    mf:result <true.srx> .
 
 :merged_default_graph rdf:type mf:QueryEvaluationTest ;
     mf:name "Merged default graphs deduplicate triples, not projected values" ;
-    mf:action [ qt:query <merged_default_graph.rq> ] ;
+    mf:action [
+        qt:query <merged_default_graph.rq> ;
+        qt:graphData <merged_graph_1.ttl>, <merged_graph_2.ttl>
+    ] ;
     mf:result <merged_default_graph.srj> .
 
 :merged_default_graph_join rdf:type mf:QueryEvaluationTest ;
     mf:name "Merged default graphs preserve duplicate join solutions after projection" ;
-    mf:action [ qt:query <merged_default_graph_join.rq> ] ;
+    mf:action [
+        qt:query <merged_default_graph_join.rq> ;
+        qt:graphData <merged_graph_1.ttl>, <merged_graph_2.ttl>
+    ] ;
     mf:result <merged_default_graph_join.srj> .
 
 :merged_default_graph_update rdf:type mf:UpdateEvaluationTest ;
@@ -78,6 +110,11 @@
         ut:data <delete_insert_solution_order_input.ttl>
     ] ;
     mf:result [ ut:data <delete_insert_solution_order_result.ttl> ] .
+
+:insert_data_trailing_reifier rdf:type mf:UpdateEvaluationTest ;
+    mf:name "INSERT DATA with a trailing reifier inserts both triples into the default graph" ;
+    mf:action [ ut:request <insert_data_trailing_reifier.ru> ] ;
+    mf:result [ ut:data <insert_data_trailing_reifier.ttl> ] .
 
 :small_unicode_escape_with_multibytes_char rdf:type mf:NegativeSyntaxTest ;
     mf:name "Multibytes character at the end of a unicode escape sequence" ;
@@ -151,6 +188,11 @@
     mf:action [ qt:query <cmp_langString.rq> ] ;
     mf:result <cmp_langString.srx> .
 
+:is_numeric_derived_integer_range rdf:type mf:QueryEvaluationTest ;
+    mf:name "isNumeric is false for a derived integer type outside its range" ;
+    mf:action [ qt:query <is_numeric_derived_integer_range.rq> ] ;
+    mf:result <is_numeric_derived_integer_range.srx> .
+
 :nested_path rdf:type mf:PositiveSyntaxTest11 ;
     mf:name "A very nested property path" ;
     mf:action <nested_path.rq> .
@@ -205,6 +247,58 @@
     mf:name "; followed by . in CONSTRUCT" ;
     mf:action <construct_semicolon_dot.rq> .
 
+:construct_property_path a mf:NegativeSyntaxTest ;
+    mf:name "Property paths cannot be converted to CONSTRUCT triples" ;
+    mf:action <construct_property_path.rq> .
+
+:construct_nested_property_path a mf:NegativeSyntaxTest ;
+    mf:name "Property paths in nested template property lists are rejected" ;
+    mf:action <construct_nested_property_path.rq> .
+
+:construct_parenthesized_predicate a mf:NegativeSyntaxTest ;
+    mf:name "Parenthesized predicates are not allowed in CONSTRUCT templates" ;
+    mf:action <construct_parenthesized_predicate.rq> .
+
+:insert_data_parenthesized_predicate a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Parenthesized predicates are not allowed in INSERT DATA" ;
+    mf:action <insert_data_parenthesized_predicate.ru> .
+
+:delete_collection a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Generated collection blank nodes are rejected in DELETE" ;
+    mf:action <delete_collection.ru> .
+
+:delete_nested_blank_node a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Blank nodes nested in triple terms are rejected in DELETE" ;
+    mf:action <delete_nested_blank_node.ru> .
+
+:delete_implicit_reifier a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Implicit reifier blank nodes are rejected in DELETE" ;
+    mf:action <delete_implicit_reifier.ru> .
+
+:insert_data_triple_subject a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Triple-term subjects in INSERT DATA return an error" ;
+    mf:action <insert_data_triple_subject.ru> .
+
+:insert_data_nested_literal_subject a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Literal subjects nested in INSERT DATA triple terms are rejected" ;
+    mf:action <insert_data_nested_literal_subject.ru> .
+
+:insert_data_nested_variable a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Variables nested in INSERT DATA triple terms are rejected" ;
+    mf:action <insert_data_nested_variable.ru> .
+
+:delete_data_nested_blank_node a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Blank nodes nested in DELETE DATA triple terms are rejected" ;
+    mf:action <delete_data_nested_blank_node.ru> .
+
+:delete_data_nested_variable a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Variables nested in DELETE DATA triple terms are rejected" ;
+    mf:action <delete_data_nested_variable.ru> .
+
+:delete_data_triple_subject a mf:NegativeUpdateSyntaxTest11 ;
+    mf:name "Triple-term subjects in DELETE DATA return an error" ;
+    mf:action <delete_data_triple_subject.ru> .
+
 :regex_variable rdf:type mf:QueryEvaluationTest ;
     mf:name "regex works even if it is not a constant" ;
     mf:action [ qt:query <regex_variable.rq> ] ;
@@ -252,3 +346,31 @@
     mf:name "same blank node multiple times in the query" ;
     mf:action [ qt:query <repeated_blank_node.rq> ; qt:data <repeated_blank_node.ttl> ] ;
     mf:result  <repeated_blank_node.srx> .
+
+:arithmetic_left_associative rdf:type mf:QueryEvaluationTest ;
+    mf:name "Chains of '+', '-', '*' and '/' associate to the left" ;
+    mf:action [ qt:query <arithmetic_left_associative.rq> ] ;
+    mf:result  <true.srx> .
+
+:arithmetic_signed_literal rdf:type mf:QueryEvaluationTest ;
+    mf:name "A signed numeric literal after an operand is added to the result of the following '*' and '/' operations" ;
+    mf:action [ qt:query <arithmetic_signed_literal.rq> ] ;
+    mf:result  <true.srx> .
+
+:graph_minus_graph_variable rdf:type mf:QueryEvaluationTest ;
+    mf:name "In GRAPH ?g { ... MINUS { ... } }, ?g in the MINUS right side is not the graph name" ;
+    mf:action [
+        qt:query <graph_minus_graph_variable.rq> ;
+        qt:graphData <graph_minus_graph_variable.ttl>
+    ] ;
+    mf:result <graph_minus_graph_variable.srj> .
+
+:pname_local_escape rdf:type mf:QueryEvaluationTest ;
+    mf:name "An escape sequence in the local part of a prefixed name stands for one character" ;
+    mf:action [ qt:query <pname_local_escape.rq> ; qt:data <pname_local_escape.ttl> ] ;
+    mf:result <true.srx> .
+
+:cast_string_whitespace rdf:type mf:QueryEvaluationTest ;
+    mf:name "Casting a string ignores leading and trailing whitespace" ;
+    mf:action [ qt:query <cast_string_whitespace.rq> ] ;
+    mf:result <cast_string_whitespace.srx> .
