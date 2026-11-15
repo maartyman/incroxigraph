@@ -353,6 +353,11 @@ class TestIncremental(unittest.TestCase):
                         tx.extend([first, second])
                     self.assertEqual(len(list(changes.deltas())), 2)
                     self.assertEqual(len(list(rows(snapshots.results()))), 2)
+            # Even after commit, the transaction owns a reference to the store.
+            del tx, store
+            gc.collect()
+            store = Store(directory)
+            self.assertEqual(set(store), {first, second})
             del store
             gc.collect()
 

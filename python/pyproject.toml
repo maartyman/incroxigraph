@@ -44,6 +44,12 @@ dynamic = [
 strip = true
 include = [{ path = "pyincroxigraph.pyi", format = "sdist" }]
 
+[tool.maturin.target.x86_64-apple-darwin]
+macos-deployment-target = "10.14"
+
+[tool.maturin.target.aarch64-apple-darwin]
+macos-deployment-target = "11.0"
+
 [dependency-groups]
 build = ["maturin~=1.0", "ruff~=0.16.0"]
 dev = [
