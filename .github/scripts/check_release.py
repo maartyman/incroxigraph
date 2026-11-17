@@ -2,12 +2,81 @@
 
 import argparse
 import json
+import math
 import re
 import subprocess
+import sys
+import time
+from collections import deque
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 REPOSITORY = "https://github.com/maartyman/incroxigraph"
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def rust_version_is_published(name, version):
+    request = Request(
+        f"https://crates.io/api/v1/crates/{name}/{version}",
+        headers={"User-Agent": f"incroxigraph-release ({REPOSITORY})"},
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            published = json.load(response).get("version", {})
+    except HTTPError as error:
+        error.close()
+        if error.code == 404:
+            return False
+        raise ValueError(
+            f"Cannot check {name} {version}: crates.io returned HTTP {error.code}. "
+            "Publishing stopped; no version was assumed missing."
+        ) from error
+    except URLError as error:
+        raise ValueError(f"Cannot check {name} {version}: {error.reason}") from error
+    if published.get("crate") != name or published.get("num") != version:
+        raise ValueError(f"Unexpected crates.io response for {name} {version}")
+    if published.get("yanked"):
+        raise ValueError(
+            f"{name} {version} is yanked; resolve this before publishing dependants"
+        )
+    return True
+
+
+def publish_rust_crate(name):
+    command = ["cargo", "publish", "--locked", "--package", name]
+    while True:
+        output = deque(maxlen=30)
+        with subprocess.Popen(
+            command, cwd=ROOT, stderr=subprocess.PIPE, text=True
+        ) as process:
+            assert process.stderr is not None
+            for line in process.stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+                output.append(line)
+            status = process.wait()
+        if status == 0:
+            return
+        error = "".join(output)
+        retry = re.search(r"Please try again after ([^\r\n]+? GMT)", error)
+        if "429 Too Many Requests" not in error or retry is None:
+            raise subprocess.CalledProcessError(status, command)
+        try:
+            retry_at = parsedate_to_datetime(retry[1])
+        except (ValueError, TypeError):
+            raise subprocess.CalledProcessError(status, command) from None
+        delay = max(
+            30, math.ceil((retry_at - datetime.now(timezone.utc)).total_seconds()) + 2
+        )
+        print(
+            f"crates.io rate limit: waiting {delay} seconds before retrying {name} "
+            f"(server retry time: {retry[1]}). You can interrupt and resume later.",
+            flush=True,
+        )
+        time.sleep(delay)
 
 
 def rust_release_order(packages, version):
@@ -95,9 +164,17 @@ def main():
             if args.offline:
                 raise ValueError("Publishing requires network access; remove --offline")
             for name in order:
-                subprocess.check_call(
-                    ["cargo", "publish", "--locked", "--package", name], cwd=ROOT
-                )
+                if rust_version_is_published(name, version):
+                    print(f"Skipping {name} {version}: already published", flush=True)
+                    continue
+                try:
+                    publish_rust_crate(name)
+                except subprocess.CalledProcessError:
+                    raise SystemExit(
+                        f"Publishing stopped at {name}. Resolve the Cargo error above, "
+                        "or wait until the registry's retry time, then rerun this command. "
+                        "Already published versions will be skipped."
+                    ) from None
 
 
 if __name__ == "__main__":
@@ -105,3 +182,8 @@ if __name__ == "__main__":
         main()
     except ValueError as error:
         raise SystemExit(str(error)) from error
+    except KeyboardInterrupt:
+        raise SystemExit(
+            "Publishing interrupted. Rerun the command to resume; "
+            "already published versions will be skipped."
+        ) from None
