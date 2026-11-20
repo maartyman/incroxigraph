@@ -547,24 +547,6 @@ impl QueryEvaluator {
             self.run_stats,
         )
     }
-
-    fn incremental_evaluator<'a, D: IncrementalQueryableDataset<'a>>(
-        &self,
-        dataset: D,
-        dataset_spec: QueryDatasetSpecification,
-        base_iri: Option<&Iri<OxString>>,
-    ) -> Result<SimpleIncrementalEvaluator<'a, D>, QueryEvaluationError> {
-        SimpleIncrementalEvaluator::new(
-            dataset,
-            base_iri.cloned(),
-            Rc::new(self.service_handler.clone()),
-            Rc::new(self.custom_functions.clone()),
-            Rc::new(self.custom_aggregate_functions.clone()),
-            self.cancellation_token.clone().unwrap_or_default(),
-            dataset_spec,
-            self.run_stats,
-        )
-    }
 }
 
 /// A prepared SPARQL query.
@@ -918,22 +900,11 @@ fn explain_incremental_expression<'a, D: IncrementalQueryableDataset<'a>>(
         pattern = Optimizer::optimize_query_expression(pattern);
     }
     let planning_duration = start_planning.elapsed();
-    let incremental_evaluator =
-        match evaluator.incremental_evaluator(dataset, dataset_spec, base_iri) {
-            Ok(evaluator) => evaluator,
-            Err(error) => {
-                return (
-                    Err(error),
-                    QueryExplanation {
-                        inner: Rc::new(EvalNodeWithStats::empty()),
-                        with_stats: evaluator.run_stats,
-                        planning_duration,
-                    },
-                );
-            }
-        };
-    let (driver, explanation) =
-        incremental_evaluator.evaluate_select_driver(&pattern, substitutions);
+    let (driver, explanation) = match evaluator.simple_evaluator(dataset, dataset_spec, base_iri) {
+        Ok(evaluator) => SimpleIncrementalEvaluator::new(evaluator)
+            .evaluate_select_driver(&pattern, substitutions),
+        Err(error) => (Err(error), Rc::new(EvalNodeWithStats::empty())),
+    };
     (
         driver,
         QueryExplanation {

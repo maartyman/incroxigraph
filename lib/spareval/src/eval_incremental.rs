@@ -1,30 +1,25 @@
 use super::{
-    EvalDataset, EvalNodeWithStats, InternalTuple, Timer, TupleSelector, encode_initial_bindings,
-    encode_variable, eval_node_label, put_pattern_value,
+    EvalDataset, EvalNodeWithStats, InternalBooleanExpressionEvaluator, InternalTuple,
+    SimpleEvaluator, Timer, TupleSelector, are_compatible_and_not_disjointed,
+    encode_initial_bindings, encode_projection, encode_variable, eval_node_label,
+    project_input_tuple, project_output_tuple, put_pattern_value,
 };
-#[cfg(feature = "sparql-12")]
-use crate::ExpressionTriple;
-use crate::expression::CustomFunctionRegistry;
-use crate::service::ServiceHandlerRegistry;
 use crate::{
-    CancellationToken, CustomAggregateFunctionRegistry, Delta, DeltaKind,
-    IncrementalQueryableDataset, InternalQuad, QueryDatasetSpecification, QueryEvaluationError,
-    QuerySolution,
+    CancellationToken, Delta, DeltaKind, IncrementalQueryableDataset, InternalQuad,
+    QueryEvaluationError, QuerySolution,
 };
-use oxiri::Iri;
-#[cfg(feature = "sparql-12")]
-use oxrdf::Triple;
 use oxrdf::{Term, Variable};
-use oxsdatatypes::{DateTime, DayTimeDuration};
-use oxstr::OxString;
-use rustc_hash::{FxHashMap, FxHasher};
-use spargebra::term::GroundTerm;
-#[cfg(feature = "sparql-12")]
-use spargebra::term::GroundTriple;
-use sparopt::algebra::{JoinAlgorithm, QueryExpression};
+use oxsdatatypes::DayTimeDuration;
+use rustc_hash::FxHashMap;
+use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern};
+use sparopt::algebra::{
+    Expression, JoinAlgorithm, LeftJoinAlgorithm, MinusAlgorithm, QueryExpression,
+};
+use sparopt::does_contain_exists;
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::future::Future;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::iter::{empty, once};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -45,9 +40,9 @@ pub enum StreamingItem<T> {
 type InternalTupleDeltaEvaluator<'a, T> =
     Rc<dyn Fn(InternalTuple<T>) -> InternalTupleDeltasIterator<'a, T> + 'a>;
 
-type InternalTupleDeltasIterator<'a, T> = Box<
-    dyn Iterator<Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>> + 'a,
->;
+type InternalTupleDeltasIterator<'a, T> = DeltaIterator<'a, InternalTuple<T>>;
+type DeltaIterator<'a, T> =
+    Box<dyn Iterator<Item = Result<StreamingItem<Delta<T>>, QueryEvaluationError>> + 'a>;
 
 pub type QuerySolutionChange = Delta<QuerySolution>;
 
@@ -304,18 +299,16 @@ impl<'a, D: IncrementalQueryableDataset<'a>> EvalDataset<'a, D> {
     }
 }
 
-type InternalQuadDeltaIterator<'a, T> = Box<
-    dyn Iterator<Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>> + 'a,
->;
+type InternalQuadDeltaIterator<'a, T> = DeltaIterator<'a, InternalQuad<T>>;
 
 /// Polls each live source once per round, so a pending source cannot starve the others.
 struct RoundRobinStreamingIterator<'a, T> {
-    iterators: Vec<Option<InternalQuadDeltaIterator<'a, T>>>,
+    iterators: Vec<Option<DeltaIterator<'a, T>>>,
     next: usize,
 }
 
 impl<'a, T> RoundRobinStreamingIterator<'a, T> {
-    fn new(iterators: Vec<InternalQuadDeltaIterator<'a, T>>) -> Self {
+    fn new(iterators: Vec<DeltaIterator<'a, T>>) -> Self {
         Self {
             iterators: iterators.into_iter().map(Some).collect(),
             next: 0,
@@ -324,7 +317,7 @@ impl<'a, T> RoundRobinStreamingIterator<'a, T> {
 }
 
 impl<T> Iterator for RoundRobinStreamingIterator<'_, T> {
-    type Item = Result<StreamingItem<Delta<InternalQuad<T>>>, QueryEvaluationError>;
+    type Item = Result<StreamingItem<Delta<T>>, QueryEvaluationError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.iterators.is_empty() {
@@ -424,73 +417,42 @@ pub struct IncrementalSelectDriver<'a, D: IncrementalQueryableDataset<'a>> {
 }
 
 pub struct SimpleIncrementalEvaluator<'a, D: IncrementalQueryableDataset<'a>> {
-    dataset: EvalDataset<'a, D>,
+    evaluator: SimpleEvaluator<'a, D>,
     notifier: Arc<IncrementalQueryNotifier>,
-    base_iri: Option<Iri<OxString>>,
-    now: DateTime,
-    service_handler: Rc<ServiceHandlerRegistry>,
-    custom_functions: Rc<CustomFunctionRegistry>,
-    custom_aggregate_functions: Rc<CustomAggregateFunctionRegistry>,
-    run_stats: bool,
 }
 
 impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
-    pub fn new(
-        dataset: D,
-        base_iri: Option<Iri<OxString>>,
-        service_handler: Rc<ServiceHandlerRegistry>,
-        custom_functions: Rc<CustomFunctionRegistry>,
-        custom_aggregate_functions: Rc<CustomAggregateFunctionRegistry>,
-        cancellation_token: CancellationToken,
-        dataset_spec: QueryDatasetSpecification,
-        run_stats: bool,
-    ) -> Result<Self, QueryEvaluationError> {
-        Ok(Self {
-            dataset: EvalDataset::new(dataset, dataset_spec, cancellation_token)?,
+    pub fn new(evaluator: SimpleEvaluator<'a, D>) -> Self {
+        Self {
+            evaluator,
             notifier: Arc::new(IncrementalQueryNotifier::new()),
-            base_iri,
-            now: DateTime::now(),
-            service_handler,
-            custom_functions,
-            custom_aggregate_functions,
-            run_stats,
-        })
+        }
     }
 
     pub fn evaluate_select_driver(
-        &self,
-        pattern: &QueryExpression,
+        self,
+        query_expression: &QueryExpression,
         substitutions: impl IntoIterator<Item = (Variable, Term)>,
     ) -> (
         Result<IncrementalSelectDriver<'a, D>, QueryEvaluationError>,
         Rc<EvalNodeWithStats>,
     ) {
-        let notifier = Arc::new(IncrementalQueryNotifier::new());
-        let evaluator = Self {
-            dataset: self.dataset.clone(),
-            notifier: Arc::clone(&notifier),
-            base_iri: self.base_iri.clone(),
-            now: self.now,
-            service_handler: Rc::clone(&self.service_handler),
-            custom_functions: Rc::clone(&self.custom_functions),
-            custom_aggregate_functions: Rc::clone(&self.custom_aggregate_functions),
-            run_stats: self.run_stats,
-        };
         let mut variables = Vec::new();
-        let (eval, stats) = evaluator.graph_pattern_evaluator(pattern, &mut variables);
+        let (eval, stats) = self.query_expression_evaluator(query_expression, &mut variables);
         let eval = match eval {
             Ok(e) => e,
             Err(e) => return (Err(e), stats),
         };
-        let from = match encode_initial_bindings(&evaluator.dataset, &variables, substitutions) {
+        let from = match encode_initial_bindings(&self.evaluator.dataset, &variables, substitutions)
+        {
             Ok(from) => from,
             Err(e) => return (Err(e), stats),
         };
         (
             Ok(IncrementalSelectDriver {
                 core: IncrementalDriverCore {
-                    dataset: evaluator.dataset.clone(),
-                    notifier,
+                    dataset: self.evaluator.dataset,
+                    notifier: self.notifier,
                 },
                 variables: Arc::from(variables),
                 iter: eval(from),
@@ -499,28 +461,31 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
         )
     }
 
-    fn graph_pattern_evaluator(
+    fn query_expression_evaluator(
         &self,
-        pattern: &QueryExpression,
+        query_expression: &QueryExpression,
         encoded_variables: &mut Vec<Variable>,
     ) -> (
         Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError>,
         Rc<EvalNodeWithStats>,
     ) {
         let mut stat_children = Vec::new();
-        let evaluator =
-            self.build_graph_pattern_evaluator(pattern, encoded_variables, &mut stat_children);
+        let evaluator = self.build_query_expression_evaluator(
+            query_expression,
+            encoded_variables,
+            &mut stat_children,
+        );
         let stats = Rc::new(EvalNodeWithStats {
-            label: eval_node_label(pattern),
+            label: eval_node_label(query_expression),
             children: stat_children,
             exec_count: Cell::new(0),
-            exec_duration: Cell::new(self.run_stats.then(DayTimeDuration::default)),
+            exec_duration: Cell::new(self.evaluator.run_stats.then(DayTimeDuration::default)),
         });
         let mut evaluator = match evaluator {
             Ok(e) => e,
             Err(e) => return (Err(e), stats),
         };
-        if self.run_stats {
+        if self.evaluator.run_stats {
             let stats = Rc::clone(&stats);
             evaluator = Rc::new(move |tuple| {
                 let start = Timer::now();
@@ -541,354 +506,434 @@ impl<'a, D: IncrementalQueryableDataset<'a>> SimpleIncrementalEvaluator<'a, D> {
         (Ok(evaluator), stats)
     }
 
-    fn build_graph_pattern_evaluator(
+    fn build_query_expression_evaluator(
         &self,
-        pattern: &QueryExpression,
+        query_expression: &QueryExpression,
         encoded_variables: &mut Vec<Variable>,
         stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
     ) -> Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
-        Ok(match pattern {
+        match query_expression {
             QueryExpression::Values {
                 variables,
                 bindings,
-            } => {
-                let encoding = variables
-                    .iter()
-                    .map(|v| encode_variable(encoded_variables, v))
-                    .collect::<Vec<_>>();
-                let encoded_tuples = bindings
-                    .iter()
-                    .map(|row| {
-                        let mut result = InternalTuple::with_capacity(variables.len());
-                        for (key, value) in row.iter().enumerate() {
-                            if let Some(term) = value {
-                                result.set(
-                                    encoding[key],
-                                    match term {
-                                        GroundTerm::NamedNode(node) => {
-                                            self.encode_term(node.clone())
-                                        }
-                                        GroundTerm::Literal(literal) => {
-                                            self.encode_term(literal.clone())
-                                        }
-                                        #[cfg(feature = "sparql-12")]
-                                        GroundTerm::Triple(triple) => self.encode_triple(triple),
-                                    }?,
-                                );
-                            }
-                        }
-                        Ok(result)
-                    })
-                    .collect::<Result<Vec<_>, QueryEvaluationError>>()?;
-                Rc::new(move |from| {
-                    Box::new(
-                        encoded_tuples
-                            .iter()
-                            .filter_map(move |t| from.combine_with(t))
-                            .map(|tuple| Ok(StreamingItem::Item(Delta::addition(tuple))))
-                            .collect::<Vec<_>>()
-                            .into_iter(),
-                    )
-                })
-            }
+            } => self.values_evaluator(variables, bindings, encoded_variables),
             QueryExpression::QuadPattern {
                 subject,
                 predicate,
                 object,
                 graph_name,
-            } => {
-                let subject_selector =
-                    TupleSelector::from_term_pattern(subject, encoded_variables, &self.dataset)?;
-                let predicate_selector = TupleSelector::from_named_node_pattern(
-                    predicate,
-                    encoded_variables,
-                    &self.dataset,
-                )?;
-                let object_selector =
-                    TupleSelector::from_term_pattern(object, encoded_variables, &self.dataset)?;
-                let graph_name_selector = if let Some(graph_name) = graph_name.as_ref() {
-                    Some(TupleSelector::from_named_node_pattern(
-                        graph_name,
-                        encoded_variables,
-                        &self.dataset,
-                    )?)
-                } else {
-                    None
-                };
-                let dataset = self.dataset.clone();
-                let notifier = Arc::downgrade(&self.notifier);
-                Rc::new(move |from| {
-                    let input_subject = match subject_selector.get_pattern_value(
-                        &from,
-                        #[cfg(feature = "sparql-12")]
-                        &dataset,
-                    ) {
-                        Ok(value) => value,
-                        Err(e) => return Box::new(once(Err(e))),
-                    };
-                    let input_predicate = match predicate_selector.get_pattern_value(
-                        &from,
-                        #[cfg(feature = "sparql-12")]
-                        &dataset,
-                    ) {
-                        Ok(value) => value,
-                        Err(e) => return Box::new(once(Err(e))),
-                    };
-                    let input_object = match object_selector.get_pattern_value(
-                        &from,
-                        #[cfg(feature = "sparql-12")]
-                        &dataset,
-                    ) {
-                        Ok(value) => value,
-                        Err(e) => return Box::new(once(Err(e))),
-                    };
-                    let input_graph_name = if let Some(graph_name_selector) = &graph_name_selector {
-                        match graph_name_selector.get_pattern_value(
-                            &from,
-                            #[cfg(feature = "sparql-12")]
-                            &dataset,
-                        ) {
-                            Ok(value) => value,
-                            Err(e) => return Box::new(once(Err(e))),
-                        }
-                        .map(Some)
-                    } else {
-                        Some(from.graph_name.clone()) // default graph
-                    };
-                    let iter = dataset.internal_quad_deltas_for_pattern(
-                        input_subject.as_ref(),
-                        input_predicate.as_ref(),
-                        input_object.as_ref(),
-                        input_graph_name.as_ref().map(|g| g.as_ref()),
-                        Weak::clone(&notifier),
-                    );
-                    let subject_selector = subject_selector.clone();
-                    let predicate_selector = predicate_selector.clone();
-                    let object_selector = object_selector.clone();
-                    let graph_name_selector = graph_name_selector.clone();
-                    #[cfg(feature = "sparql-12")]
-                    let dataset = dataset.clone();
-                    Box::new(
-                        iter.map(move |quad| match quad? {
-                            StreamingItem::Pending => Ok(Some(StreamingItem::Pending)),
-                            StreamingItem::Item(quad) => {
-                                let (kind, quad) = quad.into_parts();
-                                let mut new_tuple = from.clone();
-                                if !put_pattern_value::<D>(
-                                    &subject_selector,
-                                    quad.subject,
-                                    &mut new_tuple,
-                                    #[cfg(feature = "sparql-12")]
-                                    &dataset,
-                                )? {
-                                    return Ok(None);
-                                }
-                                if !put_pattern_value::<D>(
-                                    &predicate_selector,
-                                    quad.predicate,
-                                    &mut new_tuple,
-                                    #[cfg(feature = "sparql-12")]
-                                    &dataset,
-                                )? {
-                                    return Ok(None);
-                                }
-                                if !put_pattern_value::<D>(
-                                    &object_selector,
-                                    quad.object,
-                                    &mut new_tuple,
-                                    #[cfg(feature = "sparql-12")]
-                                    &dataset,
-                                )? {
-                                    return Ok(None);
-                                }
-                                if let Some(graph_name_selector) = &graph_name_selector {
-                                    let Some(quad_graph_name) = quad.graph_name else {
-                                        return Err(QueryEvaluationError::UnexpectedDefaultGraph);
-                                    };
-                                    if !put_pattern_value::<D>(
-                                        graph_name_selector,
-                                        quad_graph_name,
-                                        &mut new_tuple,
-                                        #[cfg(feature = "sparql-12")]
-                                        &dataset,
-                                    )? {
-                                        return Ok(None);
-                                    }
-                                }
-                                Ok(Some(StreamingItem::Item(Delta::with_kind(kind, new_tuple))))
-                            }
-                        })
-                        .filter_map(Result::transpose),
-                    )
-                })
-            }
-            QueryExpression::Path { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
-            }
-            QueryExpression::Graph { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
-            }
+            } => self.quad_pattern_evaluator(
+                subject,
+                predicate,
+                object,
+                graph_name.as_ref(),
+                encoded_variables,
+            ),
             QueryExpression::Join {
                 left,
                 right,
                 algorithm,
-            } => {
-                let (left, left_stats) = self.graph_pattern_evaluator(left, encoded_variables);
-                stat_children.push(left_stats);
-                let (right, right_stats) = self.graph_pattern_evaluator(right, encoded_variables);
-                stat_children.push(right_stats);
-                let left = left?;
-                let right = right?;
-                match algorithm {
-                    JoinAlgorithm::HashBuildLeftProbeRight { keys } => {
-                        if keys.is_empty() {
-                            Rc::new(move |from| {
-                                Box::new(SymmetricNestedLoopJoinIterator {
-                                    inputs: JoinInputs::new(left(from.clone()), right(from)),
-                                    left_values: Vec::new(),
-                                    right_values: Vec::new(),
-                                    buffered_results: Vec::new(),
-                                })
-                            })
-                        } else {
-                            let keys = keys
-                                .iter()
-                                .map(|v| encode_variable(encoded_variables, v))
-                                .collect::<Vec<_>>();
-                            Rc::new(move |from| {
-                                let left_iter = left(from.clone());
-                                let right_iter = right(from);
-                                let mut left_values = InternalTupleSet::new(keys.clone());
-                                let mut right_values = InternalTupleSet::new(keys.clone());
-                                left_values.reserve(left_iter.size_hint().0);
-                                right_values.reserve(right_iter.size_hint().0);
-                                Box::new(SymmetricHashJoinIterator {
-                                    inputs: JoinInputs::new(left_iter, right_iter),
-                                    left_values,
-                                    right_values,
-                                    buffered_results: Vec::new(),
-                                })
-                            })
-                        }
-                    }
-                }
-            }
+            } => self.join_evaluator(left, right, algorithm, encoded_variables, stat_children),
             #[cfg(feature = "sep-0006")]
             QueryExpression::Lateral { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
+                Err(unsupported_incremental_pattern(query_expression))
             }
-            QueryExpression::Minus { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
+            QueryExpression::Minus {
+                left,
+                right,
+                algorithm,
+            } => self.minus_evaluator(left, right, algorithm, encoded_variables, stat_children),
+            QueryExpression::Filter { expression, .. }
+            | QueryExpression::LeftJoin { expression, .. }
+                if does_contain_exists(expression) =>
+            {
+                Err(unsupported_incremental_pattern(query_expression))
             }
-            QueryExpression::LeftJoin { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
+            QueryExpression::LeftJoin {
+                left,
+                right,
+                expression,
+                algorithm,
+            } => self.left_join_evaluator(
+                left,
+                right,
+                expression,
+                algorithm,
+                encoded_variables,
+                stat_children,
+            ),
+            QueryExpression::Filter { inner, expression } => {
+                self.filter_evaluator(inner, expression, encoded_variables, stat_children)
             }
-            QueryExpression::Filter { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
-            }
-            QueryExpression::Union { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
-            }
-            QueryExpression::Extend { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
-            }
-            QueryExpression::OrderBy { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
-            }
-            QueryExpression::Distinct { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
-            }
-            QueryExpression::Reduced { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
-            }
-            QueryExpression::Slice { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
+            QueryExpression::Union { inner } => {
+                self.union_evaluator(inner, encoded_variables, stat_children)
             }
             QueryExpression::Project { inner, variables } => {
-                let mut inner_encoded_variables = variables.clone();
-                let (child, child_stats) =
-                    self.graph_pattern_evaluator(inner, &mut inner_encoded_variables);
-                stat_children.push(child_stats);
-                let child = child?;
-                let mapping = variables
-                    .iter()
-                    .enumerate()
-                    .map(|(new_variable, variable)| {
-                        (new_variable, encode_variable(encoded_variables, variable))
-                    })
-                    .collect::<Rc<[(usize, usize)]>>();
-                Rc::new(move |from| {
-                    let mapping = Rc::clone(&mapping);
-                    let mut input_tuple = InternalTuple::with_capacity(mapping.len());
-                    for (input_key, output_key) in &*mapping {
-                        if let Some(value) = from.get(*output_key) {
-                            input_tuple.set(*input_key, value.clone());
-                        }
-                    }
-                    input_tuple.graph_name.clone_from(&from.graph_name);
-                    Box::new(child(input_tuple).filter_map(move |change| {
-                        match change {
-                            Ok(StreamingItem::Item(delta)) => {
-                                let (kind, tuple) = delta.into_parts();
-                                let mut output_tuple = from.clone();
-                                for (input_key, output_key) in &*mapping {
-                                    if let Some(value) = tuple.get(*input_key) {
-                                        if let Some(existing_value) = output_tuple.get(*output_key)
-                                        {
-                                            if existing_value != value {
-                                                return None; // Conflict
-                                            }
-                                        } else {
-                                            output_tuple.set(*output_key, value.clone());
-                                        }
-                                    }
-                                }
-                                Some(Ok(StreamingItem::Item(Delta::with_kind(
-                                    kind,
-                                    output_tuple,
-                                ))))
-                            }
-                            Ok(StreamingItem::Pending) => Some(Ok(StreamingItem::Pending)),
-                            Err(error) => Some(Err(error)),
-                        }
-                    }))
-                })
+                self.project_evaluator(inner, variables, encoded_variables, stat_children)
             }
-            QueryExpression::Group { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
+            QueryExpression::Path { .. }
+            | QueryExpression::Graph { .. }
+            | QueryExpression::Extend { .. }
+            | QueryExpression::OrderBy { .. }
+            | QueryExpression::Distinct { .. }
+            | QueryExpression::Reduced { .. }
+            | QueryExpression::Slice { .. }
+            | QueryExpression::Group { .. }
+            | QueryExpression::Service { .. } => {
+                Err(unsupported_incremental_pattern(query_expression))
             }
-            QueryExpression::Service { .. } => {
-                return Err(unsupported_incremental_pattern(pattern));
-            }
-        })
-    }
-    fn encode_term(&self, term: impl Into<Term>) -> Result<D::InternalTerm, QueryEvaluationError> {
-        self.dataset.internalize_term(term.into())
-    }
-
-    #[cfg(feature = "sparql-12")]
-    fn encode_triple(
-        &self,
-        triple: &GroundTriple,
-    ) -> Result<D::InternalTerm, QueryEvaluationError> {
-        self.dataset.internalize_expression_term(
-            ExpressionTriple::from(Triple::from(triple.clone())).into(),
-        )
-    }
-}
-
-impl<'a, D: IncrementalQueryableDataset<'a>> Clone for SimpleIncrementalEvaluator<'a, D> {
-    fn clone(&self) -> Self {
-        Self {
-            dataset: self.dataset.clone(),
-            notifier: Arc::clone(&self.notifier),
-            base_iri: self.base_iri.clone(),
-            now: self.now,
-            service_handler: Rc::clone(&self.service_handler),
-            custom_functions: Rc::clone(&self.custom_functions),
-            custom_aggregate_functions: Rc::clone(&self.custom_aggregate_functions),
-            run_stats: self.run_stats,
         }
+    }
+
+    fn values_evaluator(
+        &self,
+        variables: &[Variable],
+        bindings: &[Vec<Option<GroundTerm>>],
+        encoded_variables: &mut Vec<Variable>,
+    ) -> Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let evaluator = self
+            .evaluator
+            .values_evaluator(variables, bindings, encoded_variables)?;
+        Ok(Rc::new(move |from| {
+            Box::new(
+                evaluator(from)
+                    .map(|tuple| tuple.map(|tuple| StreamingItem::Item(Delta::addition(tuple)))),
+            )
+        }))
+    }
+
+    fn quad_pattern_evaluator(
+        &self,
+        subject: &TermPattern,
+        predicate: &NamedNodePattern,
+        object: &TermPattern,
+        graph_name: Option<&NamedNodePattern>,
+        encoded_variables: &mut Vec<Variable>,
+    ) -> Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let dataset = &self.evaluator.dataset;
+        let subject_selector =
+            TupleSelector::from_term_pattern(subject, encoded_variables, dataset)?;
+        let predicate_selector =
+            TupleSelector::from_named_node_pattern(predicate, encoded_variables, dataset)?;
+        let object_selector = TupleSelector::from_term_pattern(object, encoded_variables, dataset)?;
+        let graph_name_selector = if let Some(graph_name) = graph_name {
+            Some(TupleSelector::from_named_node_pattern(
+                graph_name,
+                encoded_variables,
+                dataset,
+            )?)
+        } else {
+            None
+        };
+        let dataset = dataset.clone();
+        let notifier = Arc::downgrade(&self.notifier);
+        Ok(Rc::new(move |from| {
+            let input_subject = match subject_selector.get_pattern_value(
+                &from,
+                #[cfg(feature = "sparql-12")]
+                &dataset,
+            ) {
+                Ok(value) => value,
+                Err(e) => return Box::new(once(Err(e))),
+            };
+            let input_predicate = match predicate_selector.get_pattern_value(
+                &from,
+                #[cfg(feature = "sparql-12")]
+                &dataset,
+            ) {
+                Ok(value) => value,
+                Err(e) => return Box::new(once(Err(e))),
+            };
+            let input_object = match object_selector.get_pattern_value(
+                &from,
+                #[cfg(feature = "sparql-12")]
+                &dataset,
+            ) {
+                Ok(value) => value,
+                Err(e) => return Box::new(once(Err(e))),
+            };
+            let input_graph_name = if let Some(graph_name_selector) = &graph_name_selector {
+                match graph_name_selector.get_pattern_value(
+                    &from,
+                    #[cfg(feature = "sparql-12")]
+                    &dataset,
+                ) {
+                    Ok(value) => value,
+                    Err(e) => return Box::new(once(Err(e))),
+                }
+                .map(Some)
+            } else {
+                Some(from.graph_name.clone()) // default graph
+            };
+            let iter = dataset.internal_quad_deltas_for_pattern(
+                input_subject.as_ref(),
+                input_predicate.as_ref(),
+                input_object.as_ref(),
+                input_graph_name.as_ref().map(|g| g.as_ref()),
+                Weak::clone(&notifier),
+            );
+            let subject_selector = subject_selector.clone();
+            let predicate_selector = predicate_selector.clone();
+            let object_selector = object_selector.clone();
+            let graph_name_selector = graph_name_selector.clone();
+            #[cfg(feature = "sparql-12")]
+            let dataset = dataset.clone();
+            Box::new(
+                iter.map(move |quad| match quad? {
+                    StreamingItem::Pending => Ok(Some(StreamingItem::Pending)),
+                    StreamingItem::Item(quad) => {
+                        let (kind, quad) = quad.into_parts();
+                        let mut new_tuple = from.clone();
+                        if !put_pattern_value::<D>(
+                            &subject_selector,
+                            quad.subject,
+                            &mut new_tuple,
+                            #[cfg(feature = "sparql-12")]
+                            &dataset,
+                        )? {
+                            return Ok(None);
+                        }
+                        if !put_pattern_value::<D>(
+                            &predicate_selector,
+                            quad.predicate,
+                            &mut new_tuple,
+                            #[cfg(feature = "sparql-12")]
+                            &dataset,
+                        )? {
+                            return Ok(None);
+                        }
+                        if !put_pattern_value::<D>(
+                            &object_selector,
+                            quad.object,
+                            &mut new_tuple,
+                            #[cfg(feature = "sparql-12")]
+                            &dataset,
+                        )? {
+                            return Ok(None);
+                        }
+                        if let Some(graph_name_selector) = &graph_name_selector {
+                            let Some(quad_graph_name) = quad.graph_name else {
+                                return Err(QueryEvaluationError::UnexpectedDefaultGraph);
+                            };
+                            if !put_pattern_value::<D>(
+                                graph_name_selector,
+                                quad_graph_name,
+                                &mut new_tuple,
+                                #[cfg(feature = "sparql-12")]
+                                &dataset,
+                            )? {
+                                return Ok(None);
+                            }
+                        }
+                        Ok(Some(StreamingItem::Item(Delta::with_kind(kind, new_tuple))))
+                    }
+                })
+                .filter_map(Result::transpose),
+            )
+        }))
+    }
+
+    fn join_evaluator(
+        &self,
+        left: &QueryExpression,
+        right: &QueryExpression,
+        algorithm: &JoinAlgorithm,
+        encoded_variables: &mut Vec<Variable>,
+        stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
+    ) -> Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let (left, left_stats) = self.query_expression_evaluator(left, encoded_variables);
+        stat_children.push(left_stats);
+        let (right, right_stats) = self.query_expression_evaluator(right, encoded_variables);
+        stat_children.push(right_stats);
+        let left = left?;
+        let right = right?;
+        match algorithm {
+            JoinAlgorithm::HashBuildLeftProbeRight { keys } => {
+                if keys.is_empty() {
+                    Ok(Rc::new(move |from| {
+                        Box::new(SymmetricNestedLoopJoinIterator {
+                            inputs: JoinInputs::new(left(from.clone()), right(from)),
+                            left_values: Vec::new(),
+                            right_values: Vec::new(),
+                            buffered_results: Vec::new(),
+                        })
+                    }))
+                } else {
+                    let keys = keys
+                        .iter()
+                        .map(|v| encode_variable(encoded_variables, v))
+                        .collect::<Vec<_>>();
+                    Ok(Rc::new(move |from| {
+                        let left_iter = left(from.clone());
+                        let right_iter = right(from);
+                        let mut left_values = InternalTupleSet::new(keys.clone());
+                        let mut right_values = InternalTupleSet::new(keys.clone());
+                        left_values.reserve(left_iter.size_hint().0);
+                        right_values.reserve(right_iter.size_hint().0);
+                        Box::new(SymmetricHashJoinIterator {
+                            inputs: JoinInputs::new(left_iter, right_iter),
+                            left_values,
+                            right_values,
+                            buffered_results: Vec::new(),
+                        })
+                    }))
+                }
+            }
+        }
+    }
+
+    fn minus_evaluator(
+        &self,
+        left: &QueryExpression,
+        right: &QueryExpression,
+        algorithm: &MinusAlgorithm,
+        encoded_variables: &mut Vec<Variable>,
+        stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
+    ) -> Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let (left, left_stats) = self.query_expression_evaluator(left, encoded_variables);
+        stat_children.push(left_stats);
+        let (right, right_stats) = self.query_expression_evaluator(right, encoded_variables);
+        stat_children.push(right_stats);
+        let left = left?;
+        let right = right?;
+
+        match algorithm {
+            MinusAlgorithm::HashBuildRightProbeLeft { keys } => {
+                let keys = keys
+                    .iter()
+                    .map(|v| encode_variable(encoded_variables, v))
+                    .collect::<Vec<_>>();
+                Ok(Rc::new(move |from| {
+                    Box::new(MinusIterator {
+                        inputs: JoinInputs::new(left(from.clone()), right(from)),
+                        left_values: InternalTupleSet::new(keys.clone()),
+                        right_values: InternalTupleSet::new(keys.clone()),
+                        buffered_results: Vec::new(),
+                    })
+                }))
+            }
+        }
+    }
+
+    fn left_join_evaluator(
+        &self,
+        left: &QueryExpression,
+        right: &QueryExpression,
+        expression: &Expression,
+        algorithm: &LeftJoinAlgorithm,
+        encoded_variables: &mut Vec<Variable>,
+        stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
+    ) -> Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let (left, left_stats) = self.query_expression_evaluator(left, encoded_variables);
+        stat_children.push(left_stats);
+        let (right, right_stats) = self.query_expression_evaluator(right, encoded_variables);
+        stat_children.push(right_stats);
+        let left = left?;
+        let right = right?;
+        let expression = self
+            .evaluator
+            .effective_boolean_value_expression_evaluator(
+                expression,
+                encoded_variables,
+                stat_children,
+            )?;
+
+        match algorithm {
+            LeftJoinAlgorithm::HashBuildRightProbeLeft { keys } => {
+                let keys = keys
+                    .iter()
+                    .map(|v| encode_variable(encoded_variables, v))
+                    .collect::<Vec<_>>();
+                Ok(Rc::new(move |from| {
+                    Box::new(SymmetricHashLeftJoinIterator {
+                        inputs: JoinInputs::new(left(from.clone()), right(from)),
+                        expression: Rc::clone(&expression),
+                        left_values: InternalTupleSet::new(keys.clone()),
+                        right_values: InternalTupleSet::new(keys.clone()),
+                        buffered_results: VecDeque::new(),
+                    })
+                }))
+            }
+        }
+    }
+
+    fn filter_evaluator(
+        &self,
+        inner: &QueryExpression,
+        expression: &Expression,
+        encoded_variables: &mut Vec<Variable>,
+        stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
+    ) -> Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let (child, child_stats) = self.query_expression_evaluator(inner, encoded_variables);
+        stat_children.push(child_stats);
+        let child = child?;
+        let expression = self
+            .evaluator
+            .effective_boolean_value_expression_evaluator(
+                expression,
+                encoded_variables,
+                stat_children,
+            )?;
+        Ok(Rc::new(move |from| {
+            let expression = Rc::clone(&expression);
+            Box::new(child(from).filter_map(move |item| match item {
+                Ok(StreamingItem::Item(delta)) => match expression(delta.value()) {
+                    Ok(Some(true)) => Some(Ok(StreamingItem::Item(delta))),
+                    Ok(Some(false) | None) => None,
+                    Err(error) => Some(Err(error)),
+                },
+                other => Some(other),
+            }))
+        }))
+    }
+
+    fn union_evaluator(
+        &self,
+        inner: &[QueryExpression],
+        encoded_variables: &mut Vec<Variable>,
+        stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
+    ) -> Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let children = inner
+            .iter()
+            .map(|child| {
+                let (child, child_stats) =
+                    self.query_expression_evaluator(child, encoded_variables);
+                stat_children.push(child_stats);
+                child
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Rc::new(move |from| {
+            Box::new(RoundRobinStreamingIterator::new(
+                children.iter().map(|child| child(from.clone())).collect(),
+            ))
+        }))
+    }
+
+    fn project_evaluator(
+        &self,
+        inner: &QueryExpression,
+        variables: &[Variable],
+        encoded_variables: &mut Vec<Variable>,
+        stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
+    ) -> Result<InternalTupleDeltaEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
+        let mut inner_encoded_variables = variables.to_vec();
+        let (child, child_stats) =
+            self.query_expression_evaluator(inner, &mut inner_encoded_variables);
+        stat_children.push(child_stats);
+        let child = child?;
+        let mapping = encode_projection(variables, encoded_variables);
+        Ok(Rc::new(move |from| {
+            let mapping = Rc::clone(&mapping);
+            let input_tuple = project_input_tuple(&from, &mapping);
+            Box::new(child(input_tuple).filter_map(move |item| match item {
+                Ok(StreamingItem::Item(delta)) => {
+                    let (kind, tuple) = delta.into_parts();
+                    let tuple = project_output_tuple(&from, &tuple, &mapping)?;
+                    Some(Ok(StreamingItem::Item(Delta::with_kind(kind, tuple))))
+                }
+                other => Some(other),
+            }))
+        }))
     }
 }
 
@@ -973,6 +1018,7 @@ struct JoinInputs<'a, T> {
     right_done: bool,
     next_side: JoinSide,
     staged: Option<(JoinSide, Delta<InternalTuple<T>>)>,
+    right_initialized: bool,
 }
 
 impl<'a, T> JoinInputs<'a, T> {
@@ -987,6 +1033,7 @@ impl<'a, T> JoinInputs<'a, T> {
             right_done: false,
             next_side: JoinSide::Left,
             staged: None,
+            right_initialized: false,
         }
     }
 
@@ -1047,6 +1094,22 @@ impl<'a, T> JoinInputs<'a, T> {
             }
         }
 
+        self.next_ready()
+    }
+
+    fn next_left_preserving(&mut self) -> Option<JoinInputItem<T>> {
+        // Read the right side up to its first Pending or end before polling the left side.
+        // This avoids emitting unmatched left rows that the initial right rows would retract.
+        if !self.right_initialized {
+            match self.poll_side(JoinSide::Right) {
+                Some(Ok(StreamingItem::Pending)) | None => self.right_initialized = true,
+                item => return item,
+            }
+        }
+        self.next_ready()
+    }
+
+    fn next_ready(&mut self) -> Option<JoinInputItem<T>> {
         let side = self.next_side;
         self.next_side = side.other();
         match self.poll_side(side) {
@@ -1065,8 +1128,8 @@ impl<'a, T> JoinInputs<'a, T> {
 
 struct SymmetricHashJoinIterator<'a, T> {
     inputs: JoinInputs<'a, T>,
-    left_values: InternalTupleSet<T>,
-    right_values: InternalTupleSet<T>,
+    left_values: InternalTupleSet<InternalTuple<T>>,
+    right_values: InternalTupleSet<InternalTuple<T>>,
     buffered_results: Vec<Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>>,
 }
 
@@ -1115,7 +1178,7 @@ impl<T: Clone + Eq + Hash> SymmetricHashJoinIterator<'_, T> {
         );
         match delta {
             Delta::Addition(tuple) => values.insert(key, tuple),
-            Delta::Deletion(tuple) if !values.remove_one(key, &tuple) => {
+            Delta::Deletion(tuple) if values.remove_one(key, |value| value == &tuple).is_none() => {
                 return Err(non_existing_tuple_deleted());
             }
             Delta::Deletion(_) => {}
@@ -1200,13 +1263,227 @@ impl<T: Clone + Eq> Iterator for SymmetricNestedLoopJoinIterator<'_, T> {
     }
 }
 
-struct InternalTupleSet<T> {
+struct MinusIterator<'a, T> {
+    inputs: JoinInputs<'a, T>,
+    left_values: InternalTupleSet<(InternalTuple<T>, usize)>,
+    right_values: InternalTupleSet<InternalTuple<T>>,
+    // Each input delta produces only additions or only deletions, so pop order is immaterial.
+    buffered_results: Vec<Delta<InternalTuple<T>>>,
+}
+
+impl<T: Clone + Eq + Hash> Iterator for MinusIterator<'_, T> {
+    type Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(delta) = self.buffered_results.pop() {
+                return Some(Ok(StreamingItem::Item(delta)));
+            }
+            match self.inputs.next_left_preserving()? {
+                Ok(StreamingItem::Item((side, delta))) => {
+                    if let Err(error) = self.process_delta(side, delta) {
+                        return Some(Err(error));
+                    }
+                }
+                Ok(StreamingItem::Pending) => return Some(Ok(StreamingItem::Pending)),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+}
+
+impl<T: Clone + Eq + Hash> MinusIterator<'_, T> {
+    fn process_delta(
+        &mut self,
+        side: JoinSide,
+        delta: Delta<InternalTuple<T>>,
+    ) -> Result<(), QueryEvaluationError> {
+        let key = self.left_values.tuple_key(delta.value());
+        match (side, delta) {
+            (JoinSide::Left, Delta::Addition(left)) => {
+                let matches = self
+                    .right_values
+                    .get(key)
+                    .iter()
+                    .filter(|right| are_compatible_and_not_disjointed(&left, right))
+                    .count();
+                if matches == 0 {
+                    self.buffered_results.push(Delta::addition(left.clone()));
+                }
+                self.left_values.insert(key, (left, matches));
+            }
+            (JoinSide::Left, Delta::Deletion(left)) => {
+                let (_, matches) = self
+                    .left_values
+                    .remove_one(key, |(tuple, _)| tuple == &left)
+                    .ok_or_else(non_existing_tuple_deleted)?;
+                if matches == 0 {
+                    self.buffered_results.push(Delta::deletion(left));
+                }
+            }
+            (JoinSide::Right, Delta::Addition(right)) => {
+                for (left, matches) in self.left_values.get_mut(key) {
+                    if are_compatible_and_not_disjointed(left, &right) {
+                        if *matches == 0 {
+                            self.buffered_results.push(Delta::deletion(left.clone()));
+                        }
+                        *matches += 1;
+                    }
+                }
+                self.right_values.insert(key, right);
+            }
+            (JoinSide::Right, Delta::Deletion(right)) => {
+                self.right_values
+                    .remove_one(key, |tuple| tuple == &right)
+                    .ok_or_else(non_existing_tuple_deleted)?;
+                for (left, matches) in self.left_values.get_mut(key) {
+                    if are_compatible_and_not_disjointed(left, &right) {
+                        *matches -= 1;
+                        if *matches == 0 {
+                            self.buffered_results.push(Delta::addition(left.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct SymmetricHashLeftJoinIterator<'a, T> {
+    inputs: JoinInputs<'a, T>,
+    expression: InternalBooleanExpressionEvaluator<'a, T>,
+    left_values: InternalTupleSet<(InternalTuple<T>, usize)>,
+    right_values: InternalTupleSet<InternalTuple<T>>,
+    buffered_results: VecDeque<Delta<InternalTuple<T>>>,
+}
+
+impl<T: Clone + Eq + Hash> Iterator for SymmetricHashLeftJoinIterator<'_, T> {
+    type Item = Result<StreamingItem<Delta<InternalTuple<T>>>, QueryEvaluationError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(delta) = self.buffered_results.pop_front() {
+                return Some(Ok(StreamingItem::Item(delta)));
+            }
+            match self.inputs.next_left_preserving()? {
+                Ok(StreamingItem::Item((side, delta))) => {
+                    if let Err(error) = self.process_delta(side, delta) {
+                        return Some(Err(error));
+                    }
+                }
+                Ok(StreamingItem::Pending) => return Some(Ok(StreamingItem::Pending)),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+}
+
+impl<T: Clone + Eq + Hash> SymmetricHashLeftJoinIterator<'_, T> {
+    fn process_delta(
+        &mut self,
+        side: JoinSide,
+        delta: Delta<InternalTuple<T>>,
+    ) -> Result<(), QueryEvaluationError> {
+        let key = self.left_values.tuple_key(delta.value());
+        match (side, delta) {
+            (JoinSide::Left, Delta::Addition(left)) => {
+                let matches = self.emit_matches_for_left(key, &left, DeltaKind::Addition)?;
+                if matches == 0 {
+                    self.buffered_results
+                        .push_back(Delta::addition(left.clone()));
+                }
+                self.left_values.insert(key, (left, matches));
+            }
+            (JoinSide::Left, Delta::Deletion(left)) => {
+                let (_, matches) = self
+                    .left_values
+                    .remove_one(key, |(tuple, _)| tuple == &left)
+                    .ok_or_else(non_existing_tuple_deleted)?;
+                if matches == 0 {
+                    self.buffered_results.push_back(Delta::deletion(left));
+                } else {
+                    self.emit_matches_for_left(key, &left, DeltaKind::Deletion)?;
+                }
+            }
+            (JoinSide::Right, Delta::Addition(right)) => {
+                for (left, matches) in self.left_values.get_mut(key) {
+                    if let Some(joined) = Self::join_if_matches(&self.expression, left, &right)? {
+                        let first_match = *matches == 0;
+                        *matches += 1;
+                        if first_match {
+                            // The first match can produce exactly the existing unmatched row.
+                            if joined == *left {
+                                continue;
+                            }
+                            self.buffered_results
+                                .push_back(Delta::deletion(left.clone()));
+                        }
+                        self.buffered_results.push_back(Delta::addition(joined));
+                    }
+                }
+                self.right_values.insert(key, right);
+            }
+            (JoinSide::Right, Delta::Deletion(right)) => {
+                self.right_values
+                    .remove_one(key, |tuple| tuple == &right)
+                    .ok_or_else(non_existing_tuple_deleted)?;
+                for (left, matches) in self.left_values.get_mut(key) {
+                    if let Some(joined) = Self::join_if_matches(&self.expression, left, &right)? {
+                        *matches = matches
+                            .checked_sub(1)
+                            .ok_or_else(non_existing_tuple_deleted)?;
+                        if *matches == 0 && joined == *left {
+                            continue;
+                        }
+                        self.buffered_results.push_back(Delta::deletion(joined));
+                        if *matches == 0 {
+                            self.buffered_results
+                                .push_back(Delta::addition(left.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_matches_for_left(
+        &mut self,
+        key: u64,
+        left: &InternalTuple<T>,
+        kind: DeltaKind,
+    ) -> Result<usize, QueryEvaluationError> {
+        let mut matches = 0;
+        for right in self.right_values.get(key) {
+            if let Some(joined) = Self::join_if_matches(&self.expression, left, right)? {
+                self.buffered_results
+                    .push_back(Delta::with_kind(kind, joined));
+                matches += 1;
+            }
+        }
+        Ok(matches)
+    }
+
+    fn join_if_matches(
+        expression: &InternalBooleanExpressionEvaluator<'_, T>,
+        left: &InternalTuple<T>,
+        right: &InternalTuple<T>,
+    ) -> Result<Option<InternalTuple<T>>, QueryEvaluationError> {
+        let Some(joined) = left.combine_with(right) else {
+            return Ok(None);
+        };
+        Ok((expression(&joined)? == Some(true)).then_some(joined))
+    }
+}
+
+struct InternalTupleSet<V> {
     key: Vec<usize>,
-    map: FxHashMap<u64, Vec<InternalTuple<T>>>,
+    map: FxHashMap<u64, Vec<V>>,
     len: usize,
 }
 
-impl<T> InternalTupleSet<T> {
+impl<V> InternalTupleSet<V> {
     fn new(key: Vec<usize>) -> Self {
         Self {
             key,
@@ -1214,46 +1491,39 @@ impl<T> InternalTupleSet<T> {
             len: 0,
         }
     }
-}
-
-impl<T: Hash + Eq> InternalTupleSet<T> {
     fn reserve(&mut self, additional: usize) {
         self.map.reserve(additional);
     }
 
-    fn insert(&mut self, key: u64, tuple: InternalTuple<T>) {
-        self.map.entry(key).or_default().push(tuple);
+    fn insert(&mut self, key: u64, value: V) {
+        self.map.entry(key).or_default().push(value);
         self.len += 1;
     }
 
-    fn get(&self, key: u64) -> &[InternalTuple<T>] {
+    fn get(&self, key: u64) -> &[V] {
         self.map.get(&key).map_or(&[], |v| v)
     }
 
-    fn tuple_key(&self, tuple: &InternalTuple<T>) -> u64 {
-        let mut hasher = FxHasher::default();
-        for v in &self.key {
-            if let Some(val) = tuple.get(*v) {
-                val.hash(&mut hasher);
-            }
-        }
-        hasher.finish()
+    fn get_mut(&mut self, key: u64) -> &mut [V] {
+        self.map
+            .get_mut(&key)
+            .map(Vec::as_mut_slice)
+            .unwrap_or_default()
     }
 
-    fn remove_one(&mut self, key: u64, tuple: &InternalTuple<T>) -> bool {
-        let Some(values) = self.map.get_mut(&key) else {
-            return false;
-        };
-        let Some(position) = values.iter().position(|candidate| candidate == tuple) else {
-            return false;
-        };
+    fn tuple_key<T: Hash>(&self, tuple: &InternalTuple<T>) -> u64 {
+        tuple.hash_key(&self.key)
+    }
 
-        values.swap_remove(position);
+    fn remove_one(&mut self, key: u64, matches: impl FnMut(&V) -> bool) -> Option<V> {
+        let values = self.map.get_mut(&key)?;
+        let position = values.iter().position(matches)?;
+        let value = values.swap_remove(position);
         self.len -= 1;
         if values.is_empty() {
             self.map.remove(&key);
         }
-        true
+        Some(value)
     }
 }
 
