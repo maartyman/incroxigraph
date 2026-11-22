@@ -225,6 +225,52 @@ fn incremental_minus_restores_left_duplicates_after_last_match() -> Result<(), B
 }
 
 #[test]
+fn incremental_minus_requires_shared_bindings_in_the_active_graph() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let graph = NamedNode::new_unchecked("urn:g");
+    let left = Quad {
+        graph_name: graph.clone().into(),
+        ..incremental_test_quad("urn:left", Literal::from(1))
+    };
+    let disjoint = Quad {
+        graph_name: graph.clone().into(),
+        ..incremental_test_quad("urn:disjoint", Literal::from(1))
+    };
+    let blocker = Quad {
+        graph_name: graph.into(),
+        ..incremental_test_quad("urn:blocker", Literal::from(1))
+    };
+    store.insert(left)?;
+    store.insert(disjoint.clone())?;
+    let mut state = SparqlEvaluator::new()
+        .parse_query(
+            "SELECT ?v WHERE {
+                GRAPH <urn:g> {
+                    ?s <urn:left> ?v MINUS {
+                        { ?s <urn:blocker> ?other } UNION { ?unrelated <urn:disjoint> ?other }
+                    }
+                }
+            }",
+        )?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let value = Some(Literal::from(1).into());
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, value.clone())]);
+    store.insert(Quad {
+        graph_name: NamedNode::new_unchecked("urn:another-graph").into(),
+        ..blocker.clone()
+    })?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    store.insert(blocker.clone())?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(false, value.clone())]);
+    store.remove(&blocker)?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, value)]);
+    store.remove(&disjoint)?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn incremental_optional_switches_between_unmatched_and_joined_rows() -> Result<(), Box<dyn Error>> {
     let store = Store::new()?;
     let left = incremental_test_quad("urn:left", Literal::from(1));
@@ -271,6 +317,44 @@ fn incremental_optional_switches_between_unmatched_and_joined_rows() -> Result<(
         solution_deltas(&mut state, "v")?,
         [(false, value), (true, None)]
     );
+    Ok(())
+}
+
+#[test]
+fn incremental_optional_rejects_volatile_conditions() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    for (condition, function) in [
+        ("RAND() < ?v", "http://www.w3.org/ns/sparql#rand"),
+        ("IF(?v > 0, <urn:custom>(?v), false)", "urn:custom"),
+    ] {
+        for optimize in [true, false] {
+            let mut evaluator = SparqlEvaluator::new()
+                .with_custom_function(NamedNode::new_unchecked("urn:custom"), |_| {
+                    Some(Literal::from(true).into())
+                });
+            if !optimize {
+                evaluator = evaluator.without_optimizations();
+            }
+            let result = evaluator
+                .parse_query(&format!(
+                    "SELECT ?v WHERE {{
+                        ?s <urn:left> ?limit
+                        OPTIONAL {{ ?s <urn:right> ?v FILTER({condition}) }}
+                    }}"
+                ))?
+                .on_store(&store)
+                .execute_incremental_deltas();
+            let Err(error) = result else {
+                panic!("accepted a volatile OPTIONAL condition");
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Incremental OPTIONAL requires a deterministic condition. The function <{function}> may return a different result when reevaluated."
+                )
+            );
+        }
+    }
     Ok(())
 }
 
