@@ -680,19 +680,24 @@ fn read_bz2_data(url: &str) -> Vec<u8> {
 }
 
 fn bsbm_sparql_operation(file_name: &str) -> Vec<RawOperation> {
-    csv::Reader::from_reader(read_bz2_data(&format!("https://zenodo.org/records/12663333/files/{file_name}")).as_slice()).records()
-        .collect::<Result<Vec<_>, _>>().unwrap()
-        .into_iter()
-        .rev()
-        .take(300) // We take only 10 groups
-        .map(|l| {
-            match &l[1] {
-                "query" => RawOperation::Query(l[2].into()),
-                "update" => RawOperation::Update(l[2].into()),
-                _ => panic!("Unexpected operation kind {}", &l[1]),
-            }
-        })
-        .collect()
+    csv::Reader::from_reader(
+        read_bz2_data(&format!(
+            "https://zenodo.org/records/12663333/files/{file_name}"
+        ))
+        .as_slice(),
+    )
+    .records()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+    .into_iter()
+    .rev()
+    .take(300) // We take only 10 groups
+    .map(|l| match &l[1] {
+        "query" => RawOperation::Query(l[2].into()),
+        "update" => RawOperation::Update(l[2].into()),
+        _ => panic!("Unexpected operation kind {}", &l[1]),
+    })
+    .collect()
 }
 
 fn watdiv_sparql_queries(directory: &Path, names: &[&str]) -> Vec<Operation> {

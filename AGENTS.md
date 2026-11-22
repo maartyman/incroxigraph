@@ -36,7 +36,7 @@ Do not forget to `git add` the new test files.
 
 ## Fuzz testing
 
-When modifying one of the crates listed below, run each of its relevant fuzz targets for one minute with:
+When modifying one of the crates listed below, you can run each of its relevant fuzz targets for one minute with:
 ```shell
 cargo fuzz run <target> --sanitizer none -- -max_total_time=60
 ```
@@ -47,3 +47,14 @@ The fuzz targets are:
 - `spargebra`: `sparql_query` and `sparql_update`
 - `spareval`: `sparql_query_eval` and `sparql_update_eval`
 - `sparesults`: `sparql_results_json`, `sparql_results_tsv`, and `sparql_results_xml`
+
+When fixing CI errors, ignore fuzzer errors unrelated to the current change.
+
+## Code style
+
+Use the `if let` syntax (including early returns) instead of `match` where possible.
+
+## Contribution
+
+A human-written commit message is expected.
+Also, do not include the set of tests you ran in the message, the CI should take care of running tests.

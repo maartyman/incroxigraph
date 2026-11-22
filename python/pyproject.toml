@@ -51,7 +51,7 @@ macos-deployment-target = "10.14"
 macos-deployment-target = "11.0"
 
 [dependency-groups]
-build = ["maturin~=1.0", "ruff~=0.16.0"]
+build = ["maturin~=1.0", "ruff~=0.17.0"]
 dev = [
   { include-group = "build" },
   "furo",

@@ -537,6 +537,7 @@ impl QueryEvaluator {
         dataset: D,
         dataset_spec: QueryDatasetSpecification,
         base_iri: Option<&Iri<OxString>>,
+        explain: bool,
     ) -> Result<SimpleEvaluator<'a, D>, QueryEvaluationError> {
         SimpleEvaluator::new(
             dataset,
@@ -547,6 +548,7 @@ impl QueryEvaluator {
             self.cancellation_token.clone().unwrap_or_default(),
             dataset_spec,
             self.run_stats,
+            explain,
         )
     }
 }
@@ -635,7 +637,7 @@ impl PreparedQuery<'_> {
         self,
         dataset: impl QueryableDataset<'b>,
     ) -> Result<QueryResults<'b>, QueryEvaluationError> {
-        self.explain(dataset).0
+        self.evaluate(dataset, false).0
     }
 
     /// Execute a SELECT, ASK, or CONSTRUCT query incrementally and return complete result snapshots.
@@ -744,6 +746,17 @@ impl PreparedQuery<'_> {
         Result<QueryResults<'b>, QueryEvaluationError>,
         QueryExplanation,
     ) {
+        self.evaluate(dataset, true)
+    }
+
+    fn evaluate<'b>(
+        self,
+        dataset: impl QueryableDataset<'b>,
+        explain: bool,
+    ) -> (
+        Result<QueryResults<'b>, QueryEvaluationError>,
+        QueryExplanation,
+    ) {
         let start_planning = Timer::now();
         let (results, plan_node_with_stats, planning_duration) = match self.query {
             Query::Select(query) => {
@@ -756,6 +769,7 @@ impl PreparedQuery<'_> {
                     dataset,
                     self.dataset,
                     query.base_iri.as_ref(),
+                    explain,
                 ) {
                     Ok(evaluator) => evaluator.evaluate_select(&pattern, self.substitutions),
                     Err(e) => (Err(e), Rc::new(EvalNodeWithStats::empty())),
@@ -776,6 +790,7 @@ impl PreparedQuery<'_> {
                     dataset,
                     self.dataset,
                     query.base_iri.as_ref(),
+                    explain,
                 ) {
                     Ok(evaluator) => evaluator.evaluate_ask(&pattern, self.substitutions),
                     Err(e) => (Err(e), Rc::new(EvalNodeWithStats::empty())),
@@ -796,6 +811,7 @@ impl PreparedQuery<'_> {
                     dataset,
                     self.dataset,
                     query.base_iri.as_ref(),
+                    explain,
                 ) {
                     Ok(evaluator) => {
                         evaluator.evaluate_construct(&pattern, &query.template, self.substitutions)
@@ -818,6 +834,7 @@ impl PreparedQuery<'_> {
                     dataset,
                     self.dataset,
                     query.base_iri.as_ref(),
+                    explain,
                 ) {
                     Ok(evaluator) => evaluator.evaluate_describe(&pattern, self.substitutions),
                     Err(e) => (Err(e), Rc::new(EvalNodeWithStats::empty())),
@@ -913,11 +930,12 @@ fn explain_incremental_expression<'a, D: IncrementalQueryableDataset<'a>>(
         pattern = Optimizer::optimize_query_expression(pattern);
     }
     let planning_duration = start_planning.elapsed();
-    let (driver, explanation) = match evaluator.simple_evaluator(dataset, dataset_spec, base_iri) {
-        Ok(evaluator) => SimpleIncrementalEvaluator::new(evaluator)
-            .evaluate_select_driver(&pattern, substitutions),
-        Err(error) => (Err(error), Rc::new(EvalNodeWithStats::empty())),
-    };
+    let (driver, explanation) =
+        match evaluator.simple_evaluator(dataset, dataset_spec, base_iri, true) {
+            Ok(evaluator) => SimpleIncrementalEvaluator::new(evaluator)
+                .evaluate_select_driver(&pattern, substitutions),
+            Err(error) => (Err(error), Rc::new(EvalNodeWithStats::empty())),
+        };
     (
         driver,
         QueryExplanation {
@@ -1092,7 +1110,7 @@ impl<'a> PreparedDeleteInsertUpdate<'a> {
         }
         let (solutions, _) = self
             .evaluator
-            .simple_evaluator(dataset, self.dataset, self.base_iri)?
+            .simple_evaluator(dataset, self.dataset, self.base_iri, false)?
             .evaluate_select(&pattern, []);
         Ok(DeleteInsertIter::new(
             solutions?,
@@ -1656,5 +1674,75 @@ mod tests {
             Expression::FunctionCall(sparql::ADD, vec![Literal::from(2_i32).into(), x.into()]);
         let result = evaluator.evaluate_expression(&expr, std::iter::empty());
         assert!(result.is_none());
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))] // Requires threads to set the stack size.
+    fn execute_does_not_format_long_expressions() {
+        // Overflows the stack if execute() builds the labels.
+        let query = SparqlParser::new()
+            .parse_query(&format!(
+                "SELECT * WHERE {{ ?s ?p ?o FILTER(?o IN ({})) }}",
+                (0..50_000)
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .unwrap();
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let dataset = Dataset::new();
+                let results = QueryEvaluator::new()
+                    .prepare(&query)
+                    .execute(&dataset)
+                    .unwrap();
+                if let QueryResults::Solutions(solutions) = results {
+                    assert_eq!(solutions.count(), 0);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn explain_formats_expressions() {
+        let query = SparqlParser::new()
+            .parse_query("SELECT * WHERE { ?s ?p ?o FILTER(?o IN (1, 2)) }")
+            .unwrap();
+        let (_, explanation) = QueryEvaluator::new()
+            .prepare(&query)
+            .explain(&Dataset::new());
+        assert!(format!("{explanation:?}").contains("Filter("));
+    }
+
+    #[test]
+    fn cancellation_without_returned_quads() {
+        let cancellation_token = CancellationToken::new();
+        cancellation_token.cancel();
+        let dataset = Dataset::new();
+        for query in [
+            "SELECT * WHERE { VALUES ?x { 1 2 3 } VALUES ?y { 1 2 } }",
+            "SELECT * WHERE { VALUES ?s { <http://example.com/s> } ?s <http://example.com/p> ?o }",
+            "SELECT * WHERE { VALUES ?s { <http://example.com/s> } OPTIONAL { ?s <http://example.com/p> ?o } }",
+        ] {
+            let query = SparqlParser::new().parse_query(query).unwrap();
+            let results = QueryEvaluator::new()
+                .with_cancellation_token(cancellation_token.clone())
+                .prepare(&query)
+                .execute(&dataset);
+            let error = match results {
+                Ok(QueryResults::Solutions(solutions)) => {
+                    solutions.collect::<Result<Vec<_>, _>>().unwrap_err()
+                }
+                Ok(_) => unreachable!(),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, QueryEvaluationError::Cancelled),
+                "{query}: {error}"
+            );
+        }
     }
 }

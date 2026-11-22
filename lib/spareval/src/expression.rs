@@ -22,6 +22,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -838,9 +839,7 @@ where
                                 NamedNode::new_unchecked(if iri.is_absolute() {
                                     iri.into_inner()
                                 } else if let Some(base_iri) = &base_iri {
-                                    OxString::new_owned(
-                                        &try_or_ok!(base_iri.resolve(&iri).ok()).into_inner(),
-                                    )
+                                    try_or_ok!(base_iri.resolve(&iri).ok()).into_inner().into()
                                 } else {
                                     return Ok(None);
                                 })
@@ -976,7 +975,7 @@ where
                         args.push(value);
                     }
                     Ok(Some(build_plain_literal(
-                        OxString::concat(args),
+                        OxString::concat(args.iter().map(OxString::as_str).collect::<Vec<_>>()),
                         language.flatten(),
                     )))
                 }));
@@ -1062,7 +1061,7 @@ where
                         };
                         Ok(Some(build_plain_literal(
                             match regex.replace_all(text.as_str(), replacement.as_str()) {
-                                Cow::Owned(replaced) => OxString::new_owned(&replaced),
+                                Cow::Owned(replaced) => replaced.into(),
                                 Cow::Borrowed(_) => text,
                             },
                             language,
@@ -1096,7 +1095,7 @@ where
                     };
                     Ok(Some(build_plain_literal(
                         match regex.replace_all(text.as_str(), replacement.as_str()) {
-                            Cow::Owned(replaced) => OxString::new_owned(&replaced),
+                            Cow::Owned(replaced) => replaced.into(),
                             Cow::Borrowed(_) => text,
                         },
                         language,
@@ -1113,7 +1112,7 @@ where
                         value.make_mut().make_ascii_uppercase();
                         value
                     } else {
-                        OxString::new_owned(&value.to_uppercase())
+                        value.to_uppercase().into()
                     };
                     Ok(Some(build_plain_literal(value, language)))
                 }));
@@ -1128,7 +1127,7 @@ where
                         value.make_mut().make_ascii_lowercase();
                         value
                     } else {
-                        OxString::new_owned(&value.to_lowercase())
+                        value.to_lowercase().into()
                     };
                     Ok(Some(build_plain_literal(value, language)))
                 }));
@@ -1371,7 +1370,7 @@ where
                     #[cfg(not(feature = "sep-0002"))]
                     {
                         Ok(Some(ExpressionTerm::OtherTypedLiteral {
-                            value: OxString::new_owned(&result.to_string()),
+                            value: result.to_string().into(),
                             datatype: xsd::DAY_TIME_DURATION,
                         }))
                     }
@@ -1402,9 +1401,7 @@ where
                         _ => return Ok(None),
                     };
                     Ok(Some(ExpressionTerm::StringLiteral(
-                        timezone_offset.map_or_else(OxString::default, |o| {
-                            OxString::new_owned(o.to_string().as_str())
-                        }),
+                        timezone_offset.map_or_else(OxString::default, |o| o.to_string().into()),
                     )))
                 }));
             }
@@ -1474,21 +1471,19 @@ where
             }
             if *function == sparql::UUID {
                 return Ok(Rc::new(move |_| {
-                    let mut buffer = String::with_capacity(44);
+                    let mut buffer = String::with_capacity(44 + 2 * size_of::<usize>());
                     buffer.push_str("urn:uuid:");
                     generate_uuid(&mut buffer);
                     Ok(Some(ExpressionTerm::NamedNode(NamedNode::new_unchecked(
-                        OxString::new_owned(&buffer),
+                        buffer,
                     ))))
                 }));
             }
             if *function == sparql::STRUUID {
                 return Ok(Rc::new(move |_| {
-                    let mut buffer = String::with_capacity(36);
+                    let mut buffer = String::with_capacity(36 + 2 * size_of::<usize>());
                     generate_uuid(&mut buffer);
-                    Ok(Some(ExpressionTerm::StringLiteral(OxString::new_owned(
-                        &buffer,
-                    ))))
+                    Ok(Some(ExpressionTerm::StringLiteral(buffer.into())))
                 }));
             }
             if *function == sparql::MD5 {
@@ -1790,7 +1785,7 @@ where
                                     && value.abs() < Float::from(1_000_000.)
                                     || Float::from(-0.) <= value && value <= Float::from(0.)
                                 {
-                                    OxString::new_owned(&f32::from(value).to_string())
+                                    f32::from(value).to_string().into()
                                 } else {
                                     Literal::from(value).into_value()
                                 }
@@ -1800,7 +1795,7 @@ where
                                     && value.abs() < Double::from(1_000_000.)
                                     || Double::from(-0.) <= value && value <= Double::from(0.)
                                 {
-                                    OxString::new_owned(&f64::from(value).to_string())
+                                    f64::from(value).to_string().into()
                                 } else {
                                     Literal::from(value).into_value()
                                 }
@@ -1859,7 +1854,7 @@ where
                             ExpressionTerm::DoubleLiteral(value) => value.into(),
                             ExpressionTerm::IntegerLiteral(value) => value.into(),
                             ExpressionTerm::DecimalLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -1876,7 +1871,7 @@ where
                             ExpressionTerm::IntegerLiteral(value) => value.into(),
                             ExpressionTerm::DecimalLiteral(value) => value.into(),
                             ExpressionTerm::BooleanLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -1893,7 +1888,7 @@ where
                             ExpressionTerm::IntegerLiteral(value) => value.into(),
                             ExpressionTerm::DecimalLiteral(value) => value.into(),
                             ExpressionTerm::BooleanLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -1910,7 +1905,7 @@ where
                             ExpressionTerm::IntegerLiteral(value) => value,
                             ExpressionTerm::DecimalLiteral(value) => value.try_into().ok()?,
                             ExpressionTerm::BooleanLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -1927,7 +1922,7 @@ where
                             ExpressionTerm::IntegerLiteral(value) => value.into(),
                             ExpressionTerm::DecimalLiteral(value) => value,
                             ExpressionTerm::BooleanLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -1942,7 +1937,7 @@ where
                         Some(ExpressionTerm::DateLiteral(match t {
                             ExpressionTerm::DateLiteral(value) => value,
                             ExpressionTerm::DateTimeLiteral(value) => value.try_into().ok()?,
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -1957,7 +1952,7 @@ where
                         Some(ExpressionTerm::TimeLiteral(match t {
                             ExpressionTerm::TimeLiteral(value) => value,
                             ExpressionTerm::DateTimeLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -1972,7 +1967,7 @@ where
                             ExpressionTerm::DateTimeLiteral(value) => value,
                             #[cfg(feature = "sep-0002")]
                             ExpressionTerm::DateLiteral(value) => value.try_into().ok()?,
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -1988,7 +1983,7 @@ where
                             ExpressionTerm::DurationLiteral(value) => value,
                             ExpressionTerm::YearMonthDurationLiteral(value) => value.into(),
                             ExpressionTerm::DayTimeDurationLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -2003,7 +1998,7 @@ where
                         Some(ExpressionTerm::YearMonthDurationLiteral(match t {
                             ExpressionTerm::DurationLiteral(value) => value.try_into().ok()?,
                             ExpressionTerm::YearMonthDurationLiteral(value) => value,
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -2018,7 +2013,7 @@ where
                         Some(ExpressionTerm::DayTimeDurationLiteral(match t {
                             ExpressionTerm::DurationLiteral(value) => value.try_into().ok()?,
                             ExpressionTerm::DayTimeDurationLiteral(value) => value,
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -2035,7 +2030,7 @@ where
                             ExpressionTerm::GYearMonthLiteral(value) => value.try_into().ok()?,
                             ExpressionTerm::DateLiteral(value) => value.try_into().ok()?,
                             ExpressionTerm::DateTimeLiteral(value) => value.try_into().ok()?,
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -2051,7 +2046,7 @@ where
                             ExpressionTerm::GYearMonthLiteral(value) => value,
                             ExpressionTerm::DateLiteral(value) => value.into(),
                             ExpressionTerm::DateTimeLiteral(value) => value.try_into().ok()?,
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -2069,7 +2064,7 @@ where
                             ExpressionTerm::GMonthDayLiteral(value) => value.into(),
                             ExpressionTerm::DateLiteral(value) => value.into(),
                             ExpressionTerm::DateTimeLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -2085,7 +2080,7 @@ where
                             ExpressionTerm::GMonthDayLiteral(value) => value,
                             ExpressionTerm::DateLiteral(value) => value.into(),
                             ExpressionTerm::DateTimeLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -2102,7 +2097,7 @@ where
                             ExpressionTerm::GMonthDayLiteral(value) => value.into(),
                             ExpressionTerm::DateLiteral(value) => value.into(),
                             ExpressionTerm::DateTimeLiteral(value) => value.into(),
-                            ExpressionTerm::StringLiteral(value) => value.parse().ok()?,
+                            ExpressionTerm::StringLiteral(value) => from_string_cast(&value)?,
                             _ => return None,
                         }))
                     })(try_or_ok!(e(tuple)?)))
@@ -2200,9 +2195,7 @@ where
             return Ok(None);
         };
         let hash = hex::encode(H::new().chain_update(input.as_str()).finalize());
-        Ok(Some(ExpressionTerm::StringLiteral(OxString::new_owned(
-            &hash,
-        ))))
+        Ok(Some(ExpressionTerm::StringLiteral(hash.into())))
     }))
 }
 
@@ -2898,6 +2891,12 @@ fn substring(source_string: &str, start: i64, length: Option<i64>) -> Option<&st
         }
     }
     Some(start_position.map_or("", |start_position| &source_string[start_position..]))
+}
+
+/// Casting from a string first collapses its whitespace (XPath functions 19.2),
+/// and none of the cast target types allows inner whitespace.
+fn from_string_cast<T: FromStr>(value: &str) -> Option<T> {
+    value.trim_matches([' ', '\t', '\r', '\n']).parse().ok()
 }
 
 fn extract_parameters<'a, E, const N: usize>(
