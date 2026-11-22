@@ -32,6 +32,7 @@ pub use crate::eval::{
 use crate::eval::{EvalNodeWithStats, SimpleEvaluator, SimpleIncrementalEvaluator, Timer};
 use crate::expression::{
     CustomFunctionRegistry, ExpressionEvaluatorContext, build_expression_evaluator,
+    find_volatile_function,
 };
 pub use crate::model::{QueryResults, QuerySolution, QuerySolutionIter, QueryTripleIter};
 use crate::service::ServiceHandlerRegistry;
@@ -44,6 +45,7 @@ use oxsdatatypes::{DateTime, DayTimeDuration, Float};
 use oxstr::OxString;
 use spargebra::Query;
 use spargebra::algebra::QueryDatasetSpecification as AlQueryDatasetSpecification;
+use spargebra::term::NamedNodePattern;
 use spargebra::update::DeleteInsertOperation;
 #[cfg(feature = "geosparql")]
 use spargeo::GEOSPARQL_EXTENSION_FUNCTIONS;
@@ -896,6 +898,17 @@ fn explain_incremental_expression<'a, D: IncrementalQueryableDataset<'a>>(
 ) {
     let start_planning = Timer::now();
     let mut pattern = QueryExpression::from(expression);
+    // Check for volatile expressions and error if they exist
+    if let Err(error) = prepare_incremental_pattern(&mut pattern, &evaluator.custom_functions) {
+        return (
+            Err(error),
+            QueryExplanation {
+                inner: Rc::new(EvalNodeWithStats::empty()),
+                with_stats: evaluator.run_stats,
+                planning_duration: start_planning.elapsed(),
+            },
+        );
+    }
     if !evaluator.without_optimizations {
         pattern = Optimizer::optimize_query_expression(pattern);
     }
@@ -913,6 +926,74 @@ fn explain_incremental_expression<'a, D: IncrementalQueryableDataset<'a>>(
             planning_duration,
         },
     )
+}
+
+fn prepare_incremental_pattern(
+    pattern: &mut QueryExpression,
+    custom_functions: &CustomFunctionRegistry,
+) -> Result<(), QueryEvaluationError> {
+    if let QueryExpression::Graph { graph_name, inner } = pattern
+        && matches!(graph_name, NamedNodePattern::NamedNode(_))
+        && let QueryExpression::Minus { left, right, .. } = inner.as_mut()
+    {
+        // A fixed graph adds no variable to either operand's bindings.
+        for operand in [left, right] {
+            let inner = std::mem::replace(operand.as_mut(), QueryExpression::empty());
+            **operand = QueryExpression::graph(inner, graph_name.clone());
+        }
+        *pattern = std::mem::replace(inner.as_mut(), QueryExpression::empty());
+    }
+
+    match pattern {
+        QueryExpression::LeftJoin {
+            left,
+            right,
+            expression,
+            ..
+        } => {
+            // Check before the optimizer can move the condition into a separate filter.
+            if let Some(function) = find_volatile_function(expression, custom_functions) {
+                return Err(QueryEvaluationError::Unexpected(Box::new(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "Incremental OPTIONAL requires a deterministic condition. The function {function} may return a different result when reevaluated."
+                    ),
+                ))));
+            }
+            prepare_incremental_pattern(left, custom_functions)?;
+            prepare_incremental_pattern(right, custom_functions)?;
+        }
+        QueryExpression::Join { left, right, .. } | QueryExpression::Minus { left, right, .. } => {
+            prepare_incremental_pattern(left, custom_functions)?;
+            prepare_incremental_pattern(right, custom_functions)?;
+        }
+        #[cfg(feature = "sep-0006")]
+        QueryExpression::Lateral { left, right } => {
+            prepare_incremental_pattern(left, custom_functions)?;
+            prepare_incremental_pattern(right, custom_functions)?;
+        }
+        QueryExpression::Union { inner } => {
+            for child in inner {
+                prepare_incremental_pattern(child, custom_functions)?;
+            }
+        }
+        QueryExpression::Graph { inner, .. }
+        | QueryExpression::Filter { inner, .. }
+        | QueryExpression::Extend { inner, .. }
+        | QueryExpression::OrderBy { inner, .. }
+        | QueryExpression::Project { inner, .. }
+        | QueryExpression::Distinct { inner }
+        | QueryExpression::Reduced { inner }
+        | QueryExpression::Slice { inner, .. }
+        | QueryExpression::Group { inner, .. }
+        | QueryExpression::Service { inner, .. } => {
+            prepare_incremental_pattern(inner, custom_functions)?;
+        }
+        QueryExpression::Path { .. }
+        | QueryExpression::QuadPattern { .. }
+        | QueryExpression::Values { .. } => {}
+    }
+    Ok(())
 }
 
 fn unsupported_incremental_query<T>(
