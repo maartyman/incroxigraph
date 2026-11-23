@@ -32,15 +32,15 @@ import { DeltaKind, Store } from "incroxigraph-js";
 import factory from "@rdfjs/data-model";
 
 const store = new Store();
-const query = store.queryIncrementalDeltas(
-    "SELECT ?name WHERE { ?s <urn:name> ?name }",
-);
+const query = store.queryIncrementalDeltas("SELECT ?name WHERE { ?s <urn:name> ?name }");
 try {
-    store.add(factory.quad(
-        factory.namedNode("urn:alice"),
-        factory.namedNode("urn:name"),
-        factory.literal("Alice"),
-    ));
+    store.add(
+        factory.quad(
+            factory.namedNode("urn:alice"),
+            factory.namedNode("urn:name"),
+            factory.literal("Alice"),
+        ),
+    );
     for (const change of query.deltas()) {
         if (change.kind === DeltaKind.Addition) {
             console.log(change.value.get("name").value); // Alice
@@ -55,13 +55,13 @@ try {
 
 ## API overview
 
-| Method | Purpose |
-| --- | --- |
-| `store.query(text)` | Evaluate an ordinary SPARQL query once |
-| `store.queryIncrementalResults(text)` | Create a live handle whose `results()` returns complete snapshots |
-| `store.queryIncrementalDeltas(text)` | Create a live handle whose `deltas()` consumes additions and deletions |
-| `store.extend(quads)` | Insert an iterable of quads atomically |
-| `store.transaction()` | Buffer additions and deletions until an explicit `commit()` |
+| Method                                | Purpose                                                                |
+| ------------------------------------- | ---------------------------------------------------------------------- |
+| `store.query(text)`                   | Evaluate an ordinary SPARQL query once                                 |
+| `store.queryIncrementalResults(text)` | Create a live handle whose `results()` returns complete snapshots      |
+| `store.queryIncrementalDeltas(text)`  | Create a live handle whose `deltas()` consumes additions and deletions |
+| `store.extend(quads)`                 | Insert an iterable of quads atomically                                 |
+| `store.transaction()`                 | Buffer additions and deletions until an explicit `commit()`            |
 
 The ordinary store API also includes `add`, `delete`, `has`, `size`, `match`,
 `update`, `load` and `dump`. Transactions expose `add`, `delete`, `extend`,
