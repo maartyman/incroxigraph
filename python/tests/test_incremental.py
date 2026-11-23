@@ -328,6 +328,20 @@ class TestIncremental(unittest.TestCase):
             self.assertNotEqual(DeltaKind.ADDITION, DeltaKind.DELETION)
             self.assertEqual(len({DeltaKind.ADDITION, DeltaKind.DELETION}), 2)
 
+    def test_filter_tracks_matching_rows(self) -> None:
+        store = Store()
+        store.add(first)
+        text = "SELECT ?s WHERE { ?s <urn:p> ?o FILTER(?o > 1) }"
+        with store.query_incremental_results(text) as snapshots, store.query_incremental_deltas(text) as changes:
+            self.assertEqual(list(rows(snapshots.results())), [])
+            self.assertEqual(list(changes.deltas()), [])
+            store.add(second)
+            self.assertEqual([row["s"] for row in rows(snapshots.results())], [s])
+            self.assertEqual([delta.kind for delta in changes.deltas()], [DeltaKind.ADDITION])
+            store.remove(second)
+            self.assertEqual(list(rows(snapshots.results())), [])
+            self.assertEqual([delta.kind for delta in changes.deltas()], [DeltaKind.DELETION])
+
     def test_invalid_and_unsupported_queries(self) -> None:
         store = Store()
         for factory in (store.query_incremental_results, store.query_incremental_deltas):
@@ -337,7 +351,6 @@ class TestIncremental(unittest.TestCase):
                 factory(select, default_graph=DefaultGraph(), use_default_graph_as_union=True)
             for text in (
                 "DESCRIBE ?s WHERE { ?s ?p ?o }",
-                "SELECT ?s WHERE { ?s <urn:p> ?o FILTER(?o > 1) }",
                 "SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY ?s",
             ):
                 with self.subTest(query=text), self.assertRaises(NotImplementedError):

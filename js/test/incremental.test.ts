@@ -194,11 +194,36 @@ describe("incremental queries", () => {
         query.close();
     });
 
+    it("tracks rows that match a filter", () => {
+        const store = new Store([first]);
+        const text = "SELECT ?s WHERE { ?s <urn:p> ?o FILTER(STRLEN(?o) > 5) }";
+        const snapshots = store.queryIncrementalResults(text);
+        const deltas = store.queryIncrementalDeltas(text);
+        assert.deepEqual(snapshots.results(), []);
+        assert.deepEqual(deltas.deltas(), []);
+        store.add(second);
+        assert.deepEqual(
+            rows(snapshots.results()).map((row) => row.get("s")?.value),
+            [s.value],
+        );
+        assert.deepEqual(
+            changes(deltas.deltas()).map((delta) => delta.kind),
+            [DeltaKind.Addition],
+        );
+        store.delete(second);
+        assert.deepEqual(snapshots.results(), []);
+        assert.deepEqual(
+            changes(deltas.deltas()).map((delta) => delta.kind),
+            [DeltaKind.Deletion],
+        );
+        snapshots.close();
+        deltas.close();
+    });
+
     it("rejects unsupported plans and malformed options without silently requerying", () => {
         const store = new Store();
         for (const text of [
             "DESCRIBE ?s WHERE { ?s ?p ?o }",
-            "SELECT ?s WHERE { ?s <urn:p> ?o FILTER(?o > 1) }",
             "SELECT ?s WHERE { ?s <urn:p> ?o } ORDER BY ?s",
         ]) {
             assert.throws(() => store.queryIncrementalResults(text), {
