@@ -1,4 +1,4 @@
-"""Check release metadata; publish Rust crates only with --publish-rust."""
+"""Prepare or check release metadata. Publish Rust crates with --publish-rust."""
 
 import argparse
 import json
@@ -114,27 +114,16 @@ def rust_release_order(packages, version):
     return ordered
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tag", help="Expected Git tag, e.g. v0.0.1")
-    parser.add_argument(
-        "--rust", action="store_true", help="Also require publishable Rust metadata"
-    )
-    parser.add_argument(
-        "--publish-rust",
-        action="store_true",
-        help="Upload Rust crates in dependency order",
-    )
-    parser.add_argument("--offline", action="store_true")
-    args = parser.parse_args()
+def workspace_packages(offline):
     command = ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]
-    if args.offline:
+    if offline:
         command.append("--offline")
     metadata = json.loads(subprocess.check_output(command, cwd=ROOT))
     workspace = set(metadata["workspace_members"])
-    packages = [
-        package for package in metadata["packages"] if package["id"] in workspace
-    ]
+    return [package for package in metadata["packages"] if package["id"] in workspace]
+
+
+def binding_version(packages):
     bindings = {
         package["name"]: package
         for package in packages
@@ -154,6 +143,153 @@ def main():
             raise ValueError(
                 f"{name} must use version {version} and repository {REPOSITORY}"
             )
+    return version
+
+
+def git(*args, **kwargs):
+    return subprocess.run(["git", *args], cwd=ROOT, **kwargs)
+
+
+def git_output(*args):
+    return git(*args, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def commit_release_version(manifests, order, current, version, offline, head):
+    updates = {}
+    for path in manifests:
+        updated, count = re.subn(
+            rf'^version = "{re.escape(current)}"$',
+            f'version = "{version}"',
+            path.read_text(encoding="utf-8"),
+            flags=re.MULTILINE,
+        )
+        if count != 1:
+            raise ValueError(f"Could not identify the package version in {path}")
+        updates[path] = updated
+
+    workspace = ROOT / "Cargo.toml"
+    rust_names = "|".join(map(re.escape, order))
+    updates[workspace] = re.sub(
+        rf'(package = "(?:{rust_names})", version = ")={re.escape(current)}"',
+        lambda match: f'{match[1]}={version}"',
+        workspace.read_text(encoding="utf-8"),
+    )
+
+    originals = {path: path.read_bytes() for path in (*updates, ROOT / "Cargo.lock")}
+    command = ["cargo", "update", "--workspace"]
+    if offline:
+        command.append("--offline")
+    try:
+        for path, content in updates.items():
+            path.write_text(content, encoding="utf-8")
+        subprocess.run(command, cwd=ROOT, check=True)
+        updated_packages = workspace_packages(offline)
+        if binding_version(updated_packages) != version:
+            raise ValueError(f"Bindings must use the prepared version {version}")
+        rust_release_order(updated_packages, version)
+        git(
+            "commit",
+            "--only",
+            "--edit",
+            "-m",
+            f"Prepare Incroxigraph v{version}",
+            "--",
+            *originals,
+            check=True,
+        )
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        ValueError,
+        KeyboardInterrupt,
+    ) as error:
+        if git_output("rev-parse", "HEAD") != head:
+            raise ValueError(
+                f"HEAD changed while preparing v{version}. Review the current commit "
+                "and rerun --prepare."
+            ) from error
+        for path, content in originals.items():
+            path.write_bytes(content)
+        raise ValueError(
+            f"Could not prepare v{version}. "
+            f"Restored the original release files. {error}"
+        ) from None
+
+
+def prepare_release(packages, current, version, offline):
+    order = rust_release_order(packages, current)
+    names = set(order) | {"pyincroxigraph", "incroxigraph-js"}
+    manifests = [
+        Path(package["manifest_path"]) for package in packages if package["name"] in names
+    ]
+    release_files = (*manifests, ROOT / "Cargo.toml", ROOT / "Cargo.lock")
+
+    head = git_output("rev-parse", "HEAD")
+    tag = f"v{version}"
+    existing_tag = git_output("tag", "--list", tag)
+    if existing_tag:
+        tagged_commit = git(
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/tags/{tag}^{{commit}}",
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if current != version or tagged_commit != head:
+            raise ValueError(
+                f"Tag {tag} already exists. Check it before preparing this release."
+            )
+
+    if git_output("status", "--porcelain", "--", *release_files):
+        raise ValueError(
+            "Commit or stash changes to release Cargo files before running --prepare."
+        )
+
+    if existing_tag:
+        print(f"Incroxigraph {tag} is already prepared at {head[:12]}.")
+        return
+
+    if current != version:
+        commit_release_version(manifests, order, current, version, offline, head)
+        head = git_output("rev-parse", "HEAD")
+    if git("tag", tag, head).returncode:
+        raise ValueError(
+            f"Could not create tag {tag} at {head[:12]}. Rerun --prepare to retry."
+        )
+    print(f"Prepared Incroxigraph {tag} at {head[:12]} and created the local tag.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tag", help="Expected Git tag, e.g. v0.0.1")
+    parser.add_argument(
+        "--prepare",
+        metavar="VERSION",
+        help="Update the Cargo versions and lockfile, then commit and tag the release",
+    )
+    parser.add_argument(
+        "--rust", action="store_true", help="Also require publishable Rust metadata"
+    )
+    parser.add_argument(
+        "--publish-rust",
+        action="store_true",
+        help="Upload Rust crates in dependency order",
+    )
+    parser.add_argument("--offline", action="store_true")
+    args = parser.parse_args()
+    if args.prepare is not None:
+        if args.tag is not None or args.publish_rust:
+            parser.error("--prepare cannot be combined with --tag or --publish-rust")
+        if not re.fullmatch(r"\d+\.\d+\.\d+", args.prepare):
+            parser.error("--prepare requires a regular version such as 0.0.2")
+
+    packages = workspace_packages(args.offline)
+    version = binding_version(packages)
+    if args.prepare is not None:
+        prepare_release(packages, version, args.prepare, args.offline)
+        return
+
     if args.tag is not None and args.tag != f"v{version}":
         raise ValueError(f"Tag {args.tag!r} does not match package version v{version}")
     print(f"Python and npm metadata match version {version}", flush=True)
