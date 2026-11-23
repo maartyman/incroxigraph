@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bzip2",
  "codspeed-criterion-compat",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-js"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "console_error_panic_hook",
  "incroxigraph",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-oxjsonld"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "incroxigraph-oxrdf",
  "json-event-parser",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-oxrdf"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "hex",
  "incroxigraph-oxsdatatypes",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-oxrdfio"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "incroxigraph-oxjsonld",
  "incroxigraph-oxrdf",
@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-oxrdfxml"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "incroxigraph-oxrdf",
  "oxilangtag",
@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-oxrocksdb-sys"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bindgen",
  "cc",
@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-oxsdatatypes"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "js-sys",
  "thiserror 1.0.69",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-oxttl"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "incroxigraph-oxrdf",
  "memchr",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-sparesults"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "incroxigraph-oxrdf",
  "json-event-parser",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-spareval"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "hex",
  "incroxigraph-oxrdf",
@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-spargebra"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "chumsky",
  "incroxigraph-oxrdf",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-spargeo"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "geo",
  "geojson",
@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "incroxigraph-sparopt"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "incroxigraph-oxrdf",
  "incroxigraph-spargebra",
@@ -2098,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "pyincroxigraph"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "incroxigraph",
  "oxstr",
