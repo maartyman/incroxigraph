@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: sync-oxigraph
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -37,7 +40,7 @@ jobs:
         run: |
           git remote add upstream https://github.com/oxigraph/oxigraph.git
           git fetch upstream main
-          git fetch origin main
+          git fetch --prune origin
 
       - name: Check for upstream changes
         id: check
@@ -51,7 +54,14 @@ jobs:
       - name: Update sync branch
         if: steps.check.outputs.needed == 'true'
         run: |
-          git push --force origin upstream/main:refs/heads/sync/oxigraph
+          # Keep manual conflict resolutions until there are newer upstream commits to propose.
+          if git show-ref --verify --quiet refs/remotes/origin/sync/oxigraph &&
+             git merge-base --is-ancestor upstream/main origin/sync/oxigraph; then
+            echo "The sync branch already includes the latest Oxigraph main."
+            exit 0
+          fi
+
+          git push --force-with-lease=refs/heads/sync/oxigraph origin upstream/main:refs/heads/sync/oxigraph
 
       - name: Create pull request
         if: steps.check.outputs.needed == 'true'
