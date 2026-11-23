@@ -51,6 +51,7 @@ Native builds with RocksDB require Rust, a C++ toolchain and Clang.
 The binding READMEs list their additional Python or JavaScript requirements.
 
 The [Rust workspace overview](lib/README.md) describes the supporting crates.
+The [Oxigraph architecture documentation](https://github.com/oxigraph/oxigraph/wiki/Architecture) describes the underlying engine.
 Store benchmarks and their inputs are documented in
 [lib/oxigraph/benches](lib/oxigraph/benches/README.md).
 

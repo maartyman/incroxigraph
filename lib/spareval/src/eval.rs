@@ -154,6 +154,10 @@ impl<'a, D: QueryableDataset<'a>> EvalDataset<'a, D> {
         graph_name: Option<Option<&D::InternalTerm>>,
     ) -> Box<dyn Iterator<Item = Result<InternalQuad<D::InternalTerm>, QueryEvaluationError>> + 'a>
     {
+        // The lookup might not return any quad, so checking the cancellation on each returned quad is not enough
+        if let Err(error) = self.cancellation_token.ensure_alive() {
+            return Box::new(once(Err(error)));
+        }
         if let Some(graph_name) = graph_name {
             // A graph (named or default), has been specified, we only query it
             if let Some(graph_name) = graph_name {
@@ -453,6 +457,7 @@ pub struct SimpleEvaluator<'a, D: QueryableDataset<'a>> {
     custom_functions: Rc<CustomFunctionRegistry>,
     custom_aggregate_functions: Rc<CustomAggregateFunctionRegistry>,
     run_stats: bool,
+    explain: bool,
 }
 
 impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
@@ -465,6 +470,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         cancellation_token: CancellationToken,
         dataset_spec: QueryDatasetSpecification,
         run_stats: bool,
+        explain: bool,
     ) -> Result<Self, QueryEvaluationError> {
         Ok(Self {
             dataset: EvalDataset::new(dataset, dataset_spec, cancellation_token)?,
@@ -474,6 +480,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
             custom_functions,
             custom_aggregate_functions,
             run_stats,
+            explain,
         })
     }
 
@@ -757,7 +764,12 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
             } => self.service_evaluator(name, inner, *silent, encoded_variables),
         };
         let stats = Rc::new(EvalNodeWithStats {
-            label: eval_node_label(query_expression),
+            // Formatting recurses per IN item, so only when explaining.
+            label: if self.explain {
+                eval_node_label(query_expression)
+            } else {
+                String::new()
+            },
             children: stat_children,
             exec_count: Cell::new(0),
             exec_duration: Cell::new(self.run_stats.then(DayTimeDuration::default)),
@@ -1182,6 +1194,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                 let probe = right;
                 if keys.is_empty() {
                     // Cartesian product
+                    let cancellation_token = self.dataset.cancellation_token.clone();
                     Ok(Rc::new(move |from| {
                         let built_values = build(from.clone()).collect::<Result<Vec<_>, _>>();
                         if built_values.as_ref().is_err_and(|e| !e.can_be_silent()) {
@@ -1203,6 +1216,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                                 probe_tuple: None,
                                 built: built_values,
                                 built_offset: 0,
+                                cancellation_token: cancellation_token.clone(),
                             }),
                             Err(error) => Box::new(once(Err(error))),
                         }
@@ -1831,15 +1845,15 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
                     let evaluator =
                         self.expression_evaluator(expr, encoded_variables, stat_children)?;
                     if *distinct {
-                        Box::new(move || AccumulatorWrapper::DistinctExpression {
+                        Box::new(move || AccumulatorWrapper::CountDistinctExpression {
                             evaluator: Rc::clone(&evaluator),
                             seen: FxHashSet::default(),
-                            accumulator: Some(Box::new(CountAccumulator::default())),
+                            count: 0,
                         })
                     } else {
-                        Box::new(move || AccumulatorWrapper::Expression {
+                        Box::new(move || AccumulatorWrapper::CountExpression {
                             evaluator: Rc::clone(&evaluator),
-                            accumulator: Some(Box::new(CountAccumulator::default())),
+                            count: 0,
                         })
                     }
                 } else if *name == sparql::AGG_SUM {
@@ -2112,6 +2126,7 @@ impl<'a, D: QueryableDataset<'a>> Clone for SimpleEvaluator<'a, D> {
             custom_functions: Rc::clone(&self.custom_functions),
             custom_aggregate_functions: Rc::clone(&self.custom_aggregate_functions),
             run_stats: self.run_stats,
+            explain: self.explain,
         }
     }
 }
@@ -2278,6 +2293,15 @@ enum AccumulatorWrapper<'a, T> {
         evaluator: ExpressionEvaluator<'a, InternalTuple<T>, T, QueryEvaluationError>,
         count: u64,
     },
+    CountExpression {
+        evaluator: ExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm, QueryEvaluationError>,
+        count: u64,
+    },
+    CountDistinctExpression {
+        seen: FxHashSet<ExpressionTerm>,
+        evaluator: ExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm, QueryEvaluationError>,
+        count: u64,
+    },
     Sample {
         // TODO: add internal variant
         evaluator: ExpressionEvaluator<'a, InternalTuple<T>, ExpressionTerm, QueryEvaluationError>,
@@ -2311,6 +2335,23 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
                 }
             }
             Self::CountDistinctInternal {
+                seen,
+                evaluator,
+                count,
+            } => {
+                let Some(value) = evaluator(tuple)? else {
+                    return Ok(());
+                };
+                if seen.insert(value) {
+                    *count += 1;
+                }
+            }
+            Self::CountExpression { evaluator, count } => {
+                if evaluator(tuple)?.is_some() {
+                    *count += 1;
+                }
+            }
+            Self::CountDistinctExpression {
                 seen,
                 evaluator,
                 count,
@@ -2372,7 +2413,9 @@ impl<T: Clone + Eq + Hash> AccumulatorWrapper<'_, T> {
             Self::CountTuple { count, .. }
             | Self::CountDistinctTuple { count, .. }
             | Self::CountInternal { count, .. }
-            | Self::CountDistinctInternal { count, .. } => Some(ExpressionTerm::IntegerLiteral(
+            | Self::CountDistinctInternal { count, .. }
+            | Self::CountExpression { count, .. }
+            | Self::CountDistinctExpression { count, .. } => Some(ExpressionTerm::IntegerLiteral(
                 i64::try_from(count).ok()?.into(),
             )),
             Self::Sample { value, .. } => value,
@@ -2387,21 +2430,6 @@ trait Accumulator {
     fn accumulate(&mut self, element: ExpressionTerm);
 
     fn finish(&mut self) -> Option<ExpressionTerm>;
-}
-
-#[derive(Default, Debug)]
-struct CountAccumulator {
-    count: i64,
-}
-
-impl Accumulator for CountAccumulator {
-    fn accumulate(&mut self, _element: ExpressionTerm) {
-        self.count += 1;
-    }
-
-    fn finish(&mut self) -> Option<ExpressionTerm> {
-        Some(ExpressionTerm::IntegerLiteral(self.count.into()))
-    }
 }
 
 struct SumAccumulator {
@@ -2570,7 +2598,7 @@ impl Accumulator for GroupConcatAccumulator {
     fn finish(&mut self) -> Option<ExpressionTerm> {
         self.concat
             .take()
-            .map(|result| ExpressionTerm::StringLiteral(OxString::new_owned(&result)))
+            .map(|result| ExpressionTerm::StringLiteral(result.into()))
     }
 }
 
@@ -3248,6 +3276,7 @@ struct CartesianProductJoinIterator<'a, T> {
     probe_tuple: Option<InternalTuple<T>>,
     built: Vec<InternalTuple<T>>,
     built_offset: usize,
+    cancellation_token: CancellationToken,
 }
 
 impl<T: Clone + Eq> Iterator for CartesianProductJoinIterator<'_, T> {
@@ -3259,6 +3288,10 @@ impl<T: Clone + Eq> Iterator for CartesianProductJoinIterator<'_, T> {
                 (&self.probe_tuple, self.built.get(self.built_offset))
             {
                 self.built_offset += 1;
+                // This loop might produce a lot of tuples without calling any other operator, so we check the cancellation here
+                if let Err(error) = self.cancellation_token.ensure_alive() {
+                    return Some(Err(error));
+                }
                 if let Some(result_tuple) = probe_tuple.combine_with(built_tuple) {
                     return Some(Ok(result_tuple));
                 }
