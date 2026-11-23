@@ -39,12 +39,24 @@ use std::marker::PhantomData;
 use std::mem::take;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, atomic};
+use std::sync::{Arc, Mutex, atomic};
+use std::task::Waker;
 use std::{fmt, io};
+
+#[path = "eval_incremental.rs"]
+mod incremental;
+pub(crate) use incremental::SimpleIncrementalEvaluator;
+pub use incremental::{
+    IncrementalDriverState, IncrementalQueryNotifier, IncrementalSelectDriver, QuerySolutionChange,
+    StreamingItem,
+};
+
 // TODO: make expression raise error when relevant (storage I/O)
 
 type InternalTupleEvaluator<'a, T> =
     Rc<dyn Fn(InternalTuple<T>) -> InternalTuplesIterator<'a, T> + 'a>;
+type InternalBooleanExpressionEvaluator<'a, T> =
+    ExpressionEvaluator<'a, InternalTuple<T>, bool, QueryEvaluationError>;
 
 /// Wrapper on top of [`QueryableDataset`]
 struct EvalDataset<'a, D: QueryableDataset<'a>> {
@@ -406,6 +418,18 @@ impl<T: Eq> PartialEq for InternalTuple<T> {
 }
 
 impl<T: Eq> Eq for InternalTuple<T> {}
+
+impl<T: Hash> InternalTuple<T> {
+    fn hash_key(&self, key: &[usize]) -> u64 {
+        let mut hasher = FxHasher::default();
+        for &index in key {
+            if let Some(value) = self.get(index) {
+                value.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+}
 
 impl<T: Hash> Hash for InternalTuple<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -1619,41 +1643,13 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
             self.query_expression_evaluator(inner, &mut inner_encoded_variables);
         stat_children.push(child_stats);
         let child = child?;
-        let mapping = variables
-            .iter()
-            .enumerate()
-            .map(|(new_variable, variable)| {
-                (new_variable, encode_variable(encoded_variables, variable))
-            })
-            .collect::<Rc<[(usize, usize)]>>();
+        let mapping = encode_projection(variables, encoded_variables);
         Ok(Rc::new(move |from| {
             let mapping = Rc::clone(&mapping);
-            let mut input_tuple = InternalTuple::with_capacity(mapping.len());
-            for (input_key, output_key) in &*mapping {
-                if let Some(value) = from.get(*output_key) {
-                    input_tuple.set(*input_key, value.clone());
-                }
-            }
-            input_tuple.graph_name.clone_from(&from.graph_name);
-            Box::new(child(input_tuple).filter_map(move |tuple| {
-                match tuple {
-                    Ok(tuple) => {
-                        let mut output_tuple = from.clone();
-                        for (input_key, output_key) in &*mapping {
-                            if let Some(value) = tuple.get(*input_key) {
-                                if let Some(existing_value) = output_tuple.get(*output_key) {
-                                    if existing_value != value {
-                                        return None; // Conflict
-                                    }
-                                } else {
-                                    output_tuple.set(*output_key, value.clone());
-                                }
-                            }
-                        }
-                        Some(Ok(output_tuple))
-                    }
-                    Err(e) => Some(Err(e)),
-                }
+            let input_tuple = project_input_tuple(&from, &mapping);
+            Box::new(child(input_tuple).filter_map(move |tuple| match tuple {
+                Ok(tuple) => project_output_tuple(&from, &tuple, &mapping).map(Ok),
+                Err(error) => Some(Err(error)),
             }))
         }))
     }
@@ -2006,10 +2002,7 @@ impl<'a, D: QueryableDataset<'a>> SimpleEvaluator<'a, D> {
         expression: &Expression,
         encoded_variables: &mut Vec<Variable>,
         stat_children: &mut Vec<Rc<EvalNodeWithStats>>,
-    ) -> Result<
-        ExpressionEvaluator<'a, InternalTuple<D::InternalTerm>, bool, QueryEvaluationError>,
-        QueryEvaluationError,
-    > {
+    ) -> Result<InternalBooleanExpressionEvaluator<'a, D::InternalTerm>, QueryEvaluationError> {
         // TODO: avoid dyn?
         if let Some(eval) =
             self.internal_expression_evaluator(expression, encoded_variables, stat_children)?
@@ -2619,6 +2612,49 @@ impl Accumulator for CustomAccumulator {
     fn finish(&mut self) -> Option<ExpressionTerm> {
         Some(self.0.finish()?.into())
     }
+}
+
+fn encode_projection(
+    variables: &[Variable],
+    encoded_variables: &mut Vec<Variable>,
+) -> Rc<[(usize, usize)]> {
+    variables
+        .iter()
+        .enumerate()
+        .map(|(input_key, variable)| (input_key, encode_variable(encoded_variables, variable)))
+        .collect()
+}
+
+fn project_input_tuple<T: Clone>(
+    from: &InternalTuple<T>,
+    mapping: &[(usize, usize)],
+) -> InternalTuple<T> {
+    let mut input_tuple = InternalTuple::with_capacity(mapping.len());
+    for &(input_key, output_key) in mapping {
+        if let Some(value) = from.get(output_key) {
+            input_tuple.set(input_key, value.clone());
+        }
+    }
+    input_tuple.graph_name.clone_from(&from.graph_name);
+    input_tuple
+}
+
+fn project_output_tuple<T: Clone + Eq>(
+    from: &InternalTuple<T>,
+    tuple: &InternalTuple<T>,
+    mapping: &[(usize, usize)],
+) -> Option<InternalTuple<T>> {
+    let mut output_tuple = from.clone();
+    for &(input_key, output_key) in mapping {
+        if let Some(value) = tuple.get(input_key) {
+            match output_tuple.get(output_key) {
+                Some(existing_value) if existing_value != value => return None,
+                Some(_) => {}
+                None => output_tuple.set(output_key, value.clone()),
+            }
+        }
+    }
+    Some(output_tuple)
 }
 
 fn encode_variable(variables: &mut Vec<Variable>, variable: &Variable) -> usize {
@@ -3319,7 +3355,7 @@ struct HashLeftJoinIterator<'a, T> {
     left_iter: InternalTuplesIterator<'a, T>,
     right: InternalTupleSet<T>,
     buffered_results: Vec<Result<InternalTuple<T>, QueryEvaluationError>>,
-    expression: Rc<dyn Fn(&InternalTuple<T>) -> Result<Option<bool>, QueryEvaluationError> + 'a>,
+    expression: InternalBooleanExpressionEvaluator<'a, T>,
 }
 
 impl<T: Clone + Eq + Hash> Iterator for HashLeftJoinIterator<'_, T> {
@@ -3886,13 +3922,7 @@ impl<T: Hash> InternalTupleSet<T> {
     }
 
     fn tuple_key(&self, tuple: &InternalTuple<T>) -> u64 {
-        let mut hasher = FxHasher::default();
-        for v in &self.key {
-            if let Some(val) = tuple.get(*v) {
-                val.hash(&mut hasher);
-            }
-        }
-        hasher.finish()
+        tuple.hash_key(&self.key)
     }
 
     fn extend<I: IntoIterator<Item = Result<InternalTuple<T>, QueryEvaluationError>>>(
@@ -4186,6 +4216,7 @@ impl Timer {
 #[derive(Clone, Default)]
 pub struct CancellationToken {
     value: Arc<AtomicBool>,
+    wakers: Arc<Mutex<Vec<Waker>>>,
 }
 
 impl CancellationToken {
@@ -4193,12 +4224,16 @@ impl CancellationToken {
     pub fn new() -> Self {
         Self {
             value: Arc::new(AtomicBool::new(false)),
+            wakers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     #[inline]
     pub fn cancel(&self) {
         self.value.store(true, atomic::Ordering::Relaxed);
+        for waker in take(&mut *self.wakers.lock().unwrap()) {
+            waker.wake();
+        }
     }
 
     #[inline]
@@ -4212,5 +4247,19 @@ impl CancellationToken {
         } else {
             Ok(())
         }
+    }
+
+    fn register_waker(&self, waker: &Waker) {
+        let mut stored = self.wakers.lock().unwrap();
+        if !stored.iter().any(|old| old.will_wake(waker)) {
+            stored.push(waker.clone());
+        }
+    }
+
+    fn unregister_waker(&self, waker: &Waker) {
+        self.wakers
+            .lock()
+            .unwrap()
+            .retain(|old| !old.will_wake(waker));
     }
 }

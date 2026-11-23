@@ -1,14 +1,18 @@
 #![cfg(test)]
 #![expect(clippy::panic_in_result_fn)]
 
-use oxigraph::io::RdfFormat;
-use oxigraph::model::vocab::{rdf, xsd};
-use oxigraph::model::*;
+use incroxigraph::io::RdfFormat;
+use incroxigraph::model::vocab::{rdf, xsd};
+use incroxigraph::model::*;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-use oxigraph::store::Store;
+use incroxigraph::sparql::QueryResults;
+use incroxigraph::sparql::{
+    Delta, IncrementalQueryResults, QueryResultsDelta, SparqlEvaluator,
+    StoreIncrementalQueryDeltasState, StoreIncrementalQueryResultsState,
+};
+use incroxigraph::store::Store;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
-use oxigraph::store::StoreOptions;
+use incroxigraph::store::StoreOptions;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -23,6 +27,7 @@ use std::fs::{File, create_dir_all, read_dir, remove_dir};
     feature = "rocksdb"
 ))]
 use std::fs::{read, write};
+use std::future::Future;
 #[cfg(all(
     target_os = "linux",
     target_pointer_width = "64",
@@ -42,6 +47,7 @@ use std::iter::once;
     feature = "rocksdb"
 ))]
 use std::path::PathBuf;
+use std::task::{Context, Poll, Waker};
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use tempfile::TempDir;
 
@@ -59,6 +65,571 @@ wd:Q90 a schema:City ;
     schema:url "https://www.paris.fr/"^^xsd:anyURI ;
     schema:postalCode "75001" .
 "#;
+
+#[test]
+fn incremental_query_deltas_support_all_result_kinds() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+
+    let mut select = SparqlEvaluator::new()
+        .parse_query("SELECT * WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    assert_store_incremental_state(&select);
+    let QueryResultsDelta::Solutions(values) = select.deltas()? else {
+        unreachable!("expected solution deltas")
+    };
+    assert_eq!(values.count(), 0);
+
+    let mut ask = SparqlEvaluator::new()
+        .parse_query("ASK { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let QueryResultsDelta::Boolean(values) = ask.deltas()? else {
+        unreachable!("expected boolean deltas")
+    };
+    assert_eq!(values.collect::<Result<Vec<_>, _>>()?, [false]);
+
+    let quad = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    store.insert(quad.clone())?;
+
+    let QueryResultsDelta::Boolean(values) = ask.deltas()? else {
+        unreachable!("expected boolean deltas")
+    };
+    assert_eq!(values.collect::<Result<Vec<_>, _>>()?, [true]);
+
+    let mut construct = SparqlEvaluator::new()
+        .parse_query("CONSTRUCT { _:b <urn:q> ?o } WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let QueryResultsDelta::Graph(values) = construct.deltas()? else {
+        unreachable!("expected graph deltas")
+    };
+    let initial = values.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(initial.len(), 1);
+    let Delta::Addition(initial) = &initial[0] else {
+        unreachable!("expected a triple addition")
+    };
+    assert!(initial.subject.is_blank_node());
+
+    store.remove(&quad)?;
+    let QueryResultsDelta::Graph(values) = construct.deltas()? else {
+        unreachable!("expected graph deltas")
+    };
+    let removed = values.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(removed.len(), 1);
+    let Delta::Deletion(removed) = &removed[0] else {
+        unreachable!("expected a triple deletion")
+    };
+    assert_eq!(removed, initial);
+    Ok(())
+}
+
+fn assert_store_incremental_state(_: &StoreIncrementalQueryDeltasState) {}
+
+fn solution_deltas(
+    state: &mut StoreIncrementalQueryDeltasState,
+    variable: &str,
+) -> Result<Vec<(bool, Option<Term>)>, Box<dyn Error>> {
+    let QueryResultsDelta::Solutions(deltas) = state.deltas()? else {
+        unreachable!("expected solution deltas")
+    };
+    Ok(deltas
+        .map(|delta| {
+            let delta = delta?;
+            Ok((
+                matches!(delta, Delta::Addition(_)),
+                delta.value().get(variable).cloned(),
+            ))
+        })
+        .collect::<Result<_, incroxigraph::sparql::QueryEvaluationError>>()?)
+}
+
+fn incremental_test_quad(predicate: &'static str, object: impl Into<Term>) -> Quad {
+    Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked(predicate),
+        object,
+        GraphName::DefaultGraph,
+    )
+}
+
+#[test]
+fn incremental_union_preserves_duplicates_and_polls_live_branches() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut state = SparqlEvaluator::new()
+        .parse_query(
+            "SELECT ?v WHERE {
+                { <urn:s> <urn:p> ?v } UNION { VALUES ?v { 1 } } UNION { <urn:s> <urn:q> ?v }
+            }",
+        )?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let value = Literal::from(1);
+    let p = incremental_test_quad("urn:p", value.clone());
+    let q = incremental_test_quad("urn:q", value.clone());
+    let value = Some(value.into());
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, value.clone())]);
+    store.insert(q.clone())?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, value.clone())]);
+    store.insert(p.clone())?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, value.clone())]);
+    store.remove(&q)?;
+    store.remove(&p)?;
+    assert_eq!(solution_deltas(&mut state, "v")?, vec![(false, value); 2]);
+    Ok(())
+}
+
+#[test]
+fn incremental_minus_restores_left_duplicates_after_last_match() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let left = incremental_test_quad("urn:left", Literal::from(1));
+    let blocker = incremental_test_quad("urn:blocker", Literal::from(1));
+    let second_blocker = incremental_test_quad("urn:second-blocker", Literal::from(1));
+    store.insert(left.clone())?;
+    store.insert(blocker.clone())?;
+    let mut state = SparqlEvaluator::new()
+        .parse_query(
+            "SELECT ?v WHERE {
+                { { ?s <urn:left> ?v } UNION { ?s <urn:left> ?v } }
+                MINUS {
+                    { ?s <urn:blocker> ?v } UNION { ?s <urn:second-blocker> ?v }
+                    UNION { ?other <urn:noise> ?unused }
+                }
+            }",
+        )?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    store.insert(second_blocker.clone())?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    store.remove(&blocker)?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    store.remove(&second_blocker)?;
+    let value = Some(Literal::from(1).into());
+    let additions = vec![(true, value.clone()); 2];
+    let deletions = vec![(false, value); 2];
+    assert_eq!(solution_deltas(&mut state, "v")?, additions);
+    store.insert(incremental_test_quad("urn:blocker", Literal::from(2)))?;
+    store.insert(incremental_test_quad("urn:noise", Literal::from(1)))?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    store.insert(blocker.clone())?;
+    assert_eq!(solution_deltas(&mut state, "v")?, deletions);
+    store.remove(&left)?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    store.remove(&blocker)?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn incremental_minus_requires_shared_bindings_in_the_active_graph() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let graph = NamedNode::new_unchecked("urn:g");
+    let left = Quad {
+        graph_name: graph.clone().into(),
+        ..incremental_test_quad("urn:left", Literal::from(1))
+    };
+    let disjoint = Quad {
+        graph_name: graph.clone().into(),
+        ..incremental_test_quad("urn:disjoint", Literal::from(1))
+    };
+    let blocker = Quad {
+        graph_name: graph.into(),
+        ..incremental_test_quad("urn:blocker", Literal::from(1))
+    };
+    store.insert(left)?;
+    store.insert(disjoint.clone())?;
+    let mut state = SparqlEvaluator::new()
+        .parse_query(
+            "SELECT ?v WHERE {
+                GRAPH <urn:g> {
+                    ?s <urn:left> ?v MINUS {
+                        { ?s <urn:blocker> ?other } UNION { ?unrelated <urn:disjoint> ?other }
+                    }
+                }
+            }",
+        )?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let value = Some(Literal::from(1).into());
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, value.clone())]);
+    store.insert(Quad {
+        graph_name: NamedNode::new_unchecked("urn:another-graph").into(),
+        ..blocker.clone()
+    })?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    store.insert(blocker.clone())?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(false, value.clone())]);
+    store.remove(&blocker)?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, value)]);
+    store.remove(&disjoint)?;
+    assert!(solution_deltas(&mut state, "v")?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn incremental_optional_switches_between_unmatched_and_joined_rows() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let left = incremental_test_quad("urn:left", Literal::from(1));
+    let matched = incremental_test_quad("urn:right", Literal::from(2));
+    let duplicate = incremental_test_quad("urn:other", Literal::from(2));
+    store.insert(left.clone())?;
+    store.insert(incremental_test_quad("urn:right", Literal::from(0)))?;
+    store.insert(incremental_test_quad("urn:right", Literal::from("error")))?;
+    let mut state = SparqlEvaluator::new()
+        .parse_query(
+            "SELECT ?v WHERE {
+                ?s <urn:left> ?limit
+                OPTIONAL {
+                    { SELECT ?s ?v WHERE { { ?s <urn:right> ?v } UNION { ?s <urn:other> ?v } } }
+                    FILTER(?v > ?limit)
+                }
+            }",
+        )?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let value = Some(Literal::from(2).into());
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, None)]);
+    store.insert(matched.clone())?;
+    assert_eq!(
+        solution_deltas(&mut state, "v")?,
+        [(false, None), (true, value.clone())]
+    );
+    store.insert(duplicate.clone())?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, value.clone())]);
+    store.remove(&left)?;
+    assert_eq!(
+        solution_deltas(&mut state, "v")?,
+        vec![(false, value.clone()); 2]
+    );
+    store.insert(left)?;
+    assert_eq!(
+        solution_deltas(&mut state, "v")?,
+        vec![(true, value.clone()); 2]
+    );
+    store.remove(&matched)?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(false, value.clone())]);
+    store.remove(&duplicate)?;
+    assert_eq!(
+        solution_deltas(&mut state, "v")?,
+        [(false, value), (true, None)]
+    );
+    Ok(())
+}
+
+#[test]
+fn incremental_optional_rejects_volatile_conditions() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    for (condition, function) in [
+        ("RAND() < ?v", "http://www.w3.org/ns/sparql#rand"),
+        ("IF(?v > 0, <urn:custom>(?v), false)", "urn:custom"),
+    ] {
+        for optimize in [true, false] {
+            let mut evaluator = SparqlEvaluator::new()
+                .with_custom_function(NamedNode::new_unchecked("urn:custom"), |_| {
+                    Some(Literal::from(true).into())
+                });
+            if !optimize {
+                evaluator = evaluator.without_optimizations();
+            }
+            let result = evaluator
+                .parse_query(&format!(
+                    "SELECT ?v WHERE {{
+                        ?s <urn:left> ?limit
+                        OPTIONAL {{ ?s <urn:right> ?v FILTER({condition}) }}
+                    }}"
+                ))?
+                .on_store(&store)
+                .execute_incremental_deltas();
+            let Err(error) = result else {
+                panic!("accepted a volatile OPTIONAL condition");
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Incremental OPTIONAL requires a deterministic condition. The function <{function}> may return a different result when reevaluated."
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn incremental_optional_keeps_a_row_when_first_match_adds_no_bindings() -> Result<(), Box<dyn Error>>
+{
+    let store = Store::new()?;
+    store.insert(incremental_test_quad("urn:left", Literal::from(1)))?;
+    let mut state = SparqlEvaluator::new()
+        .without_optimizations()
+        .parse_query("SELECT ?s WHERE { ?s <urn:left> 1 OPTIONAL { ?s <urn:right> 2 } }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    assert_eq!(
+        solution_deltas(&mut state, "s")?,
+        [(true, Some(NamedNode::new_unchecked("urn:s").into()))]
+    );
+    let right = incremental_test_quad("urn:right", Literal::from(2));
+    store.insert(right.clone())?;
+    assert!(solution_deltas(&mut state, "s")?.is_empty());
+    store.remove(&right)?;
+    assert!(solution_deltas(&mut state, "s")?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn incremental_filter_evaluates_additions_and_deletions() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut state = SparqlEvaluator::new()
+        .parse_query("SELECT ?v WHERE { ?s <urn:p> ?v FILTER(?v > 1) }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+    let quad = incremental_test_quad("urn:p", Literal::from(2));
+    let value = Some(Literal::from(2).into());
+    store.insert(quad.clone())?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(true, value.clone())]);
+    store.remove(&quad)?;
+    assert_eq!(solution_deltas(&mut state, "v")?, [(false, value)]);
+    for value in [Literal::from(0), Literal::from("error")] {
+        let rejected = incremental_test_quad("urn:p", value);
+        store.insert(rejected.clone())?;
+        assert!(solution_deltas(&mut state, "v")?.is_empty());
+        store.remove(&rejected)?;
+        assert!(solution_deltas(&mut state, "v")?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn incremental_rejects_existence_filters() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    for query in [
+        "SELECT * WHERE { ?s <urn:p> ?v FILTER EXISTS { ?s <urn:q> ?w } }",
+        "SELECT * WHERE { ?s <urn:p> ?v FILTER(IF(?v > 1, NOT EXISTS { ?s <urn:q> ?w }, true)) }",
+        "SELECT * WHERE {
+            ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?w FILTER EXISTS { ?s <urn:r> ?v } }
+        }",
+    ] {
+        let result = SparqlEvaluator::new()
+            .parse_query(query)?
+            .on_store(&store)
+            .execute_incremental_deltas();
+        assert!(result.is_err(), "accepted existence filter in {query}");
+    }
+    Ok(())
+}
+
+#[test]
+fn incremental_query_results_support_all_result_kinds() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut select = SparqlEvaluator::new()
+        .parse_query("SELECT * WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let mut ask = SparqlEvaluator::new()
+        .parse_query("ASK { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let mut construct = SparqlEvaluator::new()
+        .parse_query("CONSTRUCT { _:b <urn:q> ?o } WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    assert_store_incremental_results_state(&select);
+
+    assert_eq!(select.variables().map(<[_]>::len), Some(2));
+    let IncrementalQueryResults::Solutions(solutions) = select.results()? else {
+        unreachable!("expected SELECT results")
+    };
+    assert_eq!(solutions.count(), 0);
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(false)
+    ));
+    let IncrementalQueryResults::Graph(triples) = construct.results()? else {
+        unreachable!("expected CONSTRUCT results")
+    };
+    assert_eq!(triples.count(), 0);
+
+    let quad = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    store.insert(quad.clone())?;
+    let IncrementalQueryResults::Solutions(solutions) = select.results()? else {
+        unreachable!("expected SELECT results")
+    };
+    assert_eq!(solutions.count(), 1);
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(true)
+    ));
+    let IncrementalQueryResults::Graph(triples) = construct.results()? else {
+        unreachable!("expected CONSTRUCT results")
+    };
+    let initial: Vec<_> = triples.cloned().collect();
+    assert_eq!(initial.len(), 1);
+    assert!(initial[0].subject.is_blank_node());
+
+    store.remove(&quad)?;
+    let IncrementalQueryResults::Solutions(solutions) = select.results()? else {
+        unreachable!("expected SELECT results")
+    };
+    assert_eq!(solutions.count(), 0);
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(false)
+    ));
+    let IncrementalQueryResults::Graph(triples) = construct.results()? else {
+        unreachable!("expected CONSTRUCT results")
+    };
+    assert_eq!(triples.count(), 0);
+    Ok(())
+}
+
+fn assert_store_incremental_results_state(_: &StoreIncrementalQueryResultsState) {}
+
+#[test]
+fn incremental_query_results_keep_boolean_and_graph_set_semantics() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut ask = SparqlEvaluator::new()
+        .parse_query("ASK { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let mut construct = SparqlEvaluator::new()
+        .parse_query("CONSTRUCT { <urn:result> <urn:q> <urn:value> } WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let first = Quad::new(
+        NamedNode::new_unchecked("urn:s1"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o1"),
+        GraphName::DefaultGraph,
+    );
+    let second = Quad::new(
+        NamedNode::new_unchecked("urn:s2"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o2"),
+        GraphName::DefaultGraph,
+    );
+
+    store.insert(first.clone())?;
+    store.insert(second.clone())?;
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(true)
+    ));
+    assert_eq!(graph_result_count(construct.results()?), 1);
+
+    store.remove(&first)?;
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(true)
+    ));
+    assert_eq!(graph_result_count(construct.results()?), 1);
+
+    store.remove(&second)?;
+    assert!(matches!(
+        ask.results()?,
+        IncrementalQueryResults::Boolean(false)
+    ));
+    assert_eq!(graph_result_count(construct.results()?), 0);
+    Ok(())
+}
+
+fn graph_result_count(results: IncrementalQueryResults<'_>) -> usize {
+    let IncrementalQueryResults::Graph(triples) = results else {
+        unreachable!("expected CONSTRUCT results")
+    };
+    triples.count()
+}
+
+#[test]
+fn incremental_query_results_iterator_emits_initial_and_changed_snapshots()
+-> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut ask = SparqlEvaluator::new()
+        .parse_query("ASK { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_results()?;
+    let mut snapshots = ask.iter_results();
+    assert!(matches!(
+        poll_ready(snapshots.next()),
+        Some(Ok(IncrementalQueryResults::Boolean(false)))
+    ));
+
+    let quad = Quad::new(
+        NamedNode::new_unchecked("urn:s"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o"),
+        GraphName::DefaultGraph,
+    );
+    store.insert(quad.clone())?;
+    assert!(matches!(
+        poll_ready(snapshots.next()),
+        Some(Ok(IncrementalQueryResults::Boolean(true)))
+    ));
+    store.remove(&quad)?;
+    assert!(matches!(
+        poll_ready(snapshots.next()),
+        Some(Ok(IncrementalQueryResults::Boolean(false)))
+    ));
+    Ok(())
+}
+
+fn poll_ready<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(value) => value,
+        Poll::Pending => unreachable!("the dataset change should already be ready"),
+    }
+}
+
+#[test]
+fn incremental_construct_deltas_have_graph_set_semantics() -> Result<(), Box<dyn Error>> {
+    let store = Store::new()?;
+    let mut state = SparqlEvaluator::new()
+        .parse_query("CONSTRUCT { <urn:result> <urn:q> <urn:value> } WHERE { ?s <urn:p> ?o }")?
+        .on_store(&store)
+        .execute_incremental_deltas()?;
+
+    let first = Quad::new(
+        NamedNode::new_unchecked("urn:s1"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o1"),
+        GraphName::DefaultGraph,
+    );
+    let second = Quad::new(
+        NamedNode::new_unchecked("urn:s2"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:o2"),
+        GraphName::DefaultGraph,
+    );
+
+    store.insert(first.clone())?;
+    assert_eq!(graph_delta_count(state.deltas()?), 1);
+    store.insert(second.clone())?;
+    assert_eq!(graph_delta_count(state.deltas()?), 0);
+    store.remove(&first)?;
+    assert_eq!(graph_delta_count(state.deltas()?), 0);
+    store.remove(&second)?;
+    assert_eq!(graph_delta_count(state.deltas()?), 1);
+    Ok(())
+}
+
+fn graph_delta_count(deltas: QueryResultsDelta<'_>) -> usize {
+    let QueryResultsDelta::Graph(values) = deltas else {
+        unreachable!("expected graph deltas")
+    };
+    values.count()
+}
 
 #[expect(clippy::non_ascii_literal)]
 const GRAPH_DATA: &str = r#"

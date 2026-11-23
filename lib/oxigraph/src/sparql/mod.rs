@@ -1,6 +1,156 @@
 //! [SPARQL](https://www.w3.org/TR/sparql11-overview/) implementation.
 //!
 //! The entry point for SPARQL execution is the [`SparqlEvaluator`] type.
+//!
+//! # Incremental queries
+//!
+//! An incremental query keeps a handle to its results as the [`Store`] changes. Parse a
+//! `SELECT`, `ASK`, or `CONSTRUCT` query, bind it with
+//! [`PreparedSparqlQuery::on_store`], and choose one of two views:
+//!
+//! - [`BoundPreparedSparqlQuery::execute_incremental_results`] retains the current results.
+//!   Call [`IncrementalQueryResultsState::results`] for an initial snapshot and again after
+//!   changes. A returned snapshot borrows the state, so consume it before calling `results()`
+//!   again.
+//! - [`BoundPreparedSparqlQuery::execute_incremental_deltas`] returns additions and deletions
+//!   since the previous call. Its batches own their data, so they can be processed after the
+//!   state is dropped. This view does not retain a complete result set for you.
+//!
+//! For example, a `SELECT` snapshot tracks both the initial state and later writes:
+//!
+//! ```
+//! use incroxigraph::model::{GraphName, NamedNode, Quad};
+//! use incroxigraph::sparql::{IncrementalQueryResults, SparqlEvaluator};
+//! use incroxigraph::store::Store;
+//!
+//! let store = Store::new().unwrap();
+//! let mut query = SparqlEvaluator::new()
+//!     .parse_query("SELECT ?s WHERE { ?s ?p ?o }").unwrap()
+//!     .on_store(&store)
+//!     .execute_incremental_results().unwrap();
+//!
+//! let IncrementalQueryResults::Solutions(rows) = query.results().unwrap() else {
+//!     unreachable!()
+//! };
+//! assert_eq!(rows.count(), 0);
+//!
+//! let ex = NamedNode::new("http://example.com").unwrap();
+//! let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), GraphName::DefaultGraph);
+//! let mut transaction = store.start_transaction().unwrap(); // Grouping updates in a transaction is best for performance.
+//! transaction.insert(quad.clone());
+//! transaction.commit().unwrap();
+//! let IncrementalQueryResults::Solutions(mut rows) = query.results().unwrap() else {
+//!     unreachable!()
+//! };
+//! assert_eq!(rows.next().unwrap().get("s"), Some(&ex.into()));
+//! ```
+//!
+//! Use deltas when maintaining your own view of the results. `SELECT` yields row additions and
+//! deletions, `ASK` yields a boolean only when its value changes (after an initial boolean), and
+//! `CONSTRUCT` yields triple additions and deletions using graph set semantics:
+//!
+//! ```
+//! use incroxigraph::model::{GraphName, NamedNode, Quad};
+//! use incroxigraph::sparql::{Delta, QueryResultsDelta, SparqlEvaluator};
+//! use incroxigraph::store::Store;
+//!
+//! let store = Store::new().unwrap();
+//! let mut query = SparqlEvaluator::new()
+//!     .parse_query("SELECT ?s WHERE { ?s ?p ?o }").unwrap()
+//!     .on_store(&store)
+//!     .execute_incremental_deltas().unwrap();
+//! let QueryResultsDelta::Solutions(initial) = query.deltas().unwrap() else { unreachable!() };
+//! assert_eq!(initial.count(), 0);
+//!
+//! let ex = NamedNode::new("http://example.com").unwrap();
+//! let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), GraphName::DefaultGraph);
+//! let mut transaction = store.start_transaction().unwrap();
+//! // Grouping updates in a transaction is best for performance.
+//! transaction.insert(quad.clone());
+//! transaction.commit().unwrap();
+//! let QueryResultsDelta::Solutions(changes) = query.deltas().unwrap() else { unreachable!() };
+//! for change in changes {
+//!     match change.unwrap() {
+//!         Delta::Addition(solution) => assert!(solution.get("s").is_some()),
+//!         Delta::Deletion(_) => unreachable!(),
+//!     }
+//! }
+//! ```
+//!
+//! `ASK` and `CONSTRUCT` use the same entry point, with different delta variants:
+//!
+//! ```
+//! use incroxigraph::model::{GraphName, NamedNode, Quad};
+//! use incroxigraph::sparql::{Delta, QueryResultsDelta, SparqlEvaluator};
+//! use incroxigraph::store::Store;
+//!
+//! let store = Store::new().unwrap();
+//! let mut ask = SparqlEvaluator::new()
+//!     .parse_query("ASK { ?s <urn:p> ?o }").unwrap()
+//!     .on_store(&store)
+//!     .execute_incremental_deltas().unwrap();
+//! let mut construct = SparqlEvaluator::new()
+//!     .parse_query("CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }").unwrap()
+//!     .on_store(&store)
+//!     .execute_incremental_deltas().unwrap();
+//! let QueryResultsDelta::Boolean(initial) = ask.deltas().unwrap() else { unreachable!() };
+//! assert_eq!(initial.collect::<Result<Vec<_>, _>>().unwrap(), [false]);
+//!
+//! let ex = NamedNode::new("http://example.com").unwrap();
+//! let quad = Quad::new(
+//!     ex.clone(),
+//!     NamedNode::new("urn:p").unwrap(),
+//!     ex.clone(),
+//!     GraphName::DefaultGraph,
+//! );
+//! let mut transaction = store.start_transaction().unwrap();
+//! // Grouping updates in a transaction is best for performance.
+//! transaction.insert(quad.clone());
+//! transaction.commit().unwrap();
+//! let QueryResultsDelta::Boolean(values) = ask.deltas().unwrap() else { unreachable!() };
+//! assert_eq!(values.collect::<Result<Vec<_>, _>>().unwrap(), [true]);
+//! let QueryResultsDelta::Graph(triples) = construct.deltas().unwrap() else { unreachable!() };
+//! assert!(matches!(triples.collect::<Result<Vec<_>, _>>().unwrap().as_slice(), [Delta::Addition(_)]));
+//! ```
+//!
+//! To wait instead of polling, call [`IncrementalQueryResultsState::iter_results`] or
+//! [`IncrementalQueryDeltasState::iter_deltas`] and await `next()`. Snapshot iteration yields
+//! its initial result, even when empty; delta iteration waits for a non-empty `SELECT` or
+//! `CONSTRUCT` batch. `ASK` deltas yield the initial boolean. A call drains all changes ready
+//! at that time and may combine several commits; it does not report every intermediate value.
+//! An asynchronous consumer can process changes as they arrive:
+//!
+//! ```no_run
+//! use incroxigraph::sparql::{QueryResultsDelta, SparqlEvaluator};
+//! use incroxigraph::store::Store;
+//!
+//! async fn watch(store: &Store) {
+//!     let mut query = SparqlEvaluator::new()
+//!         .parse_query("SELECT ?s WHERE { ?s <urn:p> ?o }").unwrap()
+//!         .on_store(store)
+//!         .execute_incremental_deltas().unwrap();
+//!     let mut batches = query.iter_deltas();
+//!     while let Some(batch) = batches.next().await {
+//!         if let QueryResultsDelta::Solutions(rows) = batch.unwrap() {
+//!             for row in rows {
+//!                 let change = row.unwrap();
+//!                 // Update an application-owned cache using change.
+//!                 let _ = change;
+//!             }
+//!         }
+//!     }
+//! }
+//! # let _ = watch;
+//! ```
+//!
+//! Store-bound queries observe committed changes, while a query bound to a transaction sees
+//! its isolated snapshot and then finishes. The handles are not `Send`, so create and drive
+//! them on the thread that owns them.
+//!
+//! If `results()`, `deltas()`, or an asynchronous `next()` returns an error, stop and drop the
+//! handle. The current batch may have been partly consumed, and a later call has no recovery
+//! guarantee. Cancellation does not automatically end the iterator: polling again can return
+//! another cancellation error immediately.
 
 mod dataset;
 mod error;
@@ -18,11 +168,15 @@ use crate::sparql::http::HttpServiceHandler;
 pub use crate::sparql::update::{BoundPreparedSparqlUpdate, PreparedSparqlUpdate};
 use crate::store::{Store, Transaction};
 pub use spareval::{
-    AggregateFunctionAccumulator, CancellationToken, DefaultServiceHandler,
-    QueryDatasetSpecification, QueryEvaluationError, QueryExplanation, QueryResults, QuerySolution,
-    QuerySolutionIter, QueryTripleIter, ServiceHandler,
+    AggregateFunctionAccumulator, CancellationToken, DefaultServiceHandler, Delta, DeltaKind,
+    IncrementalDriverState, IncrementalGraphResults, IncrementalQueryDeltasIter,
+    IncrementalQueryDeltasState, IncrementalQueryResults, IncrementalQueryResultsIter,
+    IncrementalQueryResultsState, IncrementalSelectDriver, IncrementalSelectResults,
+    QueryBooleanDeltaIter, QueryDatasetSpecification, QueryEvaluationError, QueryExplanation,
+    QueryResults, QueryResultsDelta, QuerySolution, QuerySolutionDeltaIter, QuerySolutionIter,
+    QueryTripleDeltaIter, QueryTripleIter, ServiceHandler,
 };
-use spareval::{QueryEvaluator, QueryableDataset};
+use spareval::{IncrementalQueryableDataset, QueryEvaluator, QueryableDataset};
 use spargebra::SparqlParser;
 pub use spargebra::{Query, SparqlSyntaxError, Update};
 use std::collections::HashMap;
@@ -33,6 +187,14 @@ use std::time::Duration;
 
 pub type QueryDataset = QueryDatasetSpecification;
 
+/// State for the deltas of an incremental query executed against a [`Store`].
+pub type StoreIncrementalQueryDeltasState =
+    IncrementalQueryDeltasState<'static, DatasetView<'static>>;
+
+/// State for complete incremental query results executed against a [`Store`].
+pub type StoreIncrementalQueryResultsState =
+    IncrementalQueryResultsState<'static, DatasetView<'static>>;
+
 /// SPARQL evaluator.
 ///
 /// It supports [SPARQL 1.1 query](https://www.w3.org/TR/sparql11-query/) and [SPARQL 1.1 update](https://www.w3.org/TR/sparql11-update/).
@@ -42,9 +204,9 @@ pub type QueryDataset = QueryDatasetSpecification;
 ///
 /// Usage example disabling the federated query support:
 /// ```
-/// use oxigraph::model::NamedNode;
-/// use oxigraph::sparql::SparqlEvaluator;
-/// use oxigraph::store::Store;
+/// use incroxigraph::model::NamedNode;
+/// use incroxigraph::sparql::SparqlEvaluator;
+/// use incroxigraph::store::Store;
 ///
 /// SparqlEvaluator::new()
 ///     .with_custom_function(NamedNode::new("http://example.com/identity")?, |args| {
@@ -76,9 +238,9 @@ impl SparqlEvaluator {
     /// Provides an IRI that could be used to resolve the operation relative IRIs.
     ///
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+    /// use incroxigraph::store::Store;
     ///
     /// if let QueryResults::Solutions(mut solutions) = SparqlEvaluator::new()
     ///     .with_base_iri("http://example.com/")?
@@ -102,9 +264,9 @@ impl SparqlEvaluator {
     /// Set a default IRI prefix used during parsing.
     ///
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+    /// use incroxigraph::store::Store;
     ///
     /// if let QueryResults::Solutions(mut solutions) = SparqlEvaluator::new()
     ///     .with_prefix("ex", "http://example.com/")?
@@ -190,9 +352,9 @@ impl SparqlEvaluator {
     ///
     /// Example with a function serializing terms to N-Triples:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+    /// use incroxigraph::store::Store;
     ///
     /// if let QueryResults::Solutions(mut solutions) = SparqlEvaluator::new()
     ///     .with_custom_function(
@@ -223,8 +385,8 @@ impl SparqlEvaluator {
     /// Returns the list of custom functions currently registered in the evaluator.
     ///
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::sparql::SparqlEvaluator;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::sparql::SparqlEvaluator;
     ///
     /// let evaluator = SparqlEvaluator::new().with_custom_function(
     ///     NamedNode::new("http://www.w3.org/ns/formats/N-Triples")?,
@@ -246,9 +408,9 @@ impl SparqlEvaluator {
     ///
     /// Example with a function doing concatenation:
     /// ```
-    /// use oxigraph::model::{Literal, NamedNode, Term};
-    /// use oxigraph::sparql::{AggregateFunctionAccumulator, QueryResults, SparqlEvaluator};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::{Literal, NamedNode, Term};
+    /// use incroxigraph::sparql::{AggregateFunctionAccumulator, QueryResults, SparqlEvaluator};
+    /// use incroxigraph::store::Store;
     /// use std::mem::take;
     ///
     /// struct ConcatAccumulator {
@@ -320,11 +482,11 @@ impl SparqlEvaluator {
     /// Might be used to abort a query cleanly.
     ///
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::sparql::{
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::sparql::{
     ///     CancellationToken, QueryEvaluationError, QueryResults, SparqlEvaluator,
     /// };
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::store::Store;
     ///
     /// let store = Store::new()?;
     /// store.insert(Quad::new(
@@ -371,9 +533,9 @@ impl SparqlEvaluator {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+    /// use incroxigraph::store::Store;
     ///
     /// let store = Store::new()?;
     /// let ex = NamedNode::new("http://example.com")?;
@@ -406,9 +568,9 @@ impl SparqlEvaluator {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+    /// use incroxigraph::store::Store;
     /// use spargebra::SparqlParser;
     ///
     /// let store = Store::new()?;
@@ -446,8 +608,8 @@ impl SparqlEvaluator {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::sparql::SparqlEvaluator;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::sparql::SparqlEvaluator;
+    /// use incroxigraph::store::Store;
     ///
     /// SparqlEvaluator::new()
     ///     .parse_update(
@@ -469,8 +631,8 @@ impl SparqlEvaluator {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::sparql::SparqlEvaluator;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::sparql::SparqlEvaluator;
+    /// use incroxigraph::store::Store;
     /// use spargebra::SparqlParser;
     ///
     /// let update = SparqlParser::new().parse_update(
@@ -519,9 +681,9 @@ impl Default for SparqlEvaluator {
 ///
 /// Usage example:
 /// ```
-/// use oxigraph::model::{Literal, Variable};
-/// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-/// use oxigraph::store::Store;
+/// use incroxigraph::model::{Literal, Variable};
+/// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+/// use incroxigraph::store::Store;
 ///
 /// let prepared_query = SparqlEvaluator::new()
 ///     .parse_query("SELECT ?v WHERE {}")?
@@ -553,9 +715,9 @@ impl PreparedSparqlQuery {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::{Literal, Variable};
-    /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::{Literal, Variable};
+    /// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+    /// use incroxigraph::store::Store;
     ///
     /// let prepared_query = SparqlEvaluator::new()
     ///     .parse_query("SELECT ?x ?v WHERE { BIND(?v+1 AS ?x) }")?
@@ -630,9 +792,9 @@ impl PreparedSparqlQuery {
 ///
 /// Usage example:
 /// ```
-/// use oxigraph::model::{Literal, Variable};
-/// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-/// use oxigraph::store::Store;
+/// use incroxigraph::model::{Literal, Variable};
+/// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+/// use incroxigraph::store::Store;
 ///
 /// let prepared_query = SparqlEvaluator::new()
 ///     .parse_query("SELECT ?v WHERE {}")?
@@ -665,9 +827,9 @@ impl<'a, D: QueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::{Literal, Variable};
-    /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::{Literal, Variable};
+    /// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+    /// use incroxigraph::store::Store;
     ///
     /// let prepared_query = SparqlEvaluator::new()
     ///     .parse_query("SELECT ?x ?v WHERE { BIND(?v+1 AS ?x)}")?
@@ -715,8 +877,8 @@ impl<'a, D: QueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
     ///
     /// Usage example serializing the explanation with statistics in JSON:
     /// ```
-    /// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+    /// use incroxigraph::store::Store;
     ///
     /// if let (Ok(QueryResults::Solutions(solutions)), explanation) = SparqlEvaluator::new()
     ///     .parse_query("SELECT ?s WHERE { VALUES ?s { 1 2 3 } }")?
@@ -742,5 +904,61 @@ impl<'a, D: QueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
         }
         *prepared.dataset_mut() = self.dataset;
         prepared.explain(self.queryable_dataset)
+    }
+}
+
+impl<'a, D: IncrementalQueryableDataset<'a>> BoundPreparedSparqlQuery<'a, D> {
+    /// Evaluate the query incrementally and return state for complete result snapshots.
+    pub fn execute_incremental_results(
+        self,
+    ) -> Result<IncrementalQueryResultsState<'a, D>, QueryEvaluationError> {
+        let mut prepared = self.evaluator.prepare(&self.query);
+        for (variable, term) in self.substitutions {
+            prepared = prepared.substitute_variable(variable, term);
+        }
+        *prepared.dataset_mut() = self.dataset;
+        prepared.execute_incremental_results(self.queryable_dataset)
+    }
+
+    /// Evaluate the query incrementally and return state for result deltas.
+    pub fn execute_incremental_deltas(
+        self,
+    ) -> Result<IncrementalQueryDeltasState<'a, D>, QueryEvaluationError> {
+        let mut prepared = self.evaluator.prepare(&self.query);
+        for (variable, term) in self.substitutions {
+            prepared = prepared.substitute_variable(variable, term);
+        }
+        *prepared.dataset_mut() = self.dataset;
+        prepared.execute_incremental_deltas(self.queryable_dataset)
+    }
+
+    /// Evaluate the query incrementally and return a query explanation with result state.
+    pub fn explain_incremental_results(
+        self,
+    ) -> (
+        Result<IncrementalQueryResultsState<'a, D>, QueryEvaluationError>,
+        QueryExplanation,
+    ) {
+        let mut prepared = self.evaluator.prepare(&self.query);
+        for (variable, term) in self.substitutions {
+            prepared = prepared.substitute_variable(variable, term);
+        }
+        *prepared.dataset_mut() = self.dataset;
+        prepared.explain_incremental_results(self.queryable_dataset)
+    }
+
+    /// Evaluate the query incrementally and return a query explanation with delta state.
+    pub fn explain_incremental_deltas(
+        self,
+    ) -> (
+        Result<IncrementalQueryDeltasState<'a, D>, QueryEvaluationError>,
+        QueryExplanation,
+    ) {
+        let mut prepared = self.evaluator.prepare(&self.query);
+        for (variable, term) in self.substitutions {
+            prepared = prepared.substitute_variable(variable, term);
+        }
+        *prepared.dataset_mut() = self.dataset;
+        prepared.explain_incremental_deltas(self.queryable_dataset)
     }
 }

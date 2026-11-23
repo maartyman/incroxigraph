@@ -1628,7 +1628,7 @@ fn wrap_in_possible_graph(
     }
 }
 
-fn does_contain_exists(expression: &Expression) -> bool {
+pub fn does_contain_exists(expression: &Expression) -> bool {
     match expression {
         Expression::Exists(_) => true,
         Expression::NamedNode(_)

@@ -1,0 +1,86 @@
+name: Sync Oxigraph
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"
+      timezone: "Europe/Brussels"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-oxigraph
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Syncing upstream also updates .github/workflows/, which GITHUB_TOKEN cannot do.
+      # Add the OXIGRAPH_SYNC_TOKEN repository Actions secret with a fine-grained PAT
+      # limited to this repository, granting Contents, Pull requests, and Workflows
+      # read and write access.
+      - name: Check sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.OXIGRAPH_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Missing OXIGRAPH_SYNC_TOKEN repository secret. See the setup comments in .github/workflows/sync-oxigraph.yml."
+            exit 1
+          fi
+
+      - name: Checkout Incroxigraph
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.OXIGRAPH_SYNC_TOKEN }}
+
+      - name: Fetch Oxigraph
+        run: |
+          git remote add upstream https://github.com/oxigraph/oxigraph.git
+          git fetch upstream main
+          git fetch --prune origin
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update sync branch
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          # Keep manual conflict resolutions until there are newer upstream commits to propose.
+          if git show-ref --verify --quiet refs/remotes/origin/sync/oxigraph &&
+             git merge-base --is-ancestor upstream/main origin/sync/oxigraph; then
+            echo "The sync branch already includes the latest Oxigraph main."
+            exit 0
+          fi
+
+          git push --force-with-lease=refs/heads/sync/oxigraph origin upstream/main:refs/heads/sync/oxigraph
+
+      - name: Create pull request
+        if: steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.OXIGRAPH_SYNC_TOKEN }}
+        run: |
+          PR_COUNT=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head sync/oxigraph \
+            --state open \
+            --json number \
+            --jq 'length')
+
+          if [ "$PR_COUNT" -eq 0 ]; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head sync/oxigraph \
+              --title "Sync changes from Oxigraph" \
+              --body "Automated PR to merge the latest changes from oxigraph/oxigraph."
+          fi

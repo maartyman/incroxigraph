@@ -29,6 +29,36 @@ use thiserror::Error;
 pub type CustomFunctionRegistry =
     HashMap<NamedNode, Arc<dyn (Fn(&[Term]) -> Option<Term>) + Send + Sync>>;
 
+pub(crate) fn find_volatile_function<'e>(
+    expression: &'e Expression,
+    custom_functions: &CustomFunctionRegistry,
+) -> Option<&'e NamedNode> {
+    let find_volatile = |expression| find_volatile_function(expression, custom_functions);
+    match expression {
+        Expression::FunctionCall(name, args) => {
+            if custom_functions.contains_key(name)
+                || [sparql::RAND, sparql::UUID, sparql::STRUUID].contains(name)
+                || (*name == sparql::BNODE && args.is_empty())
+            {
+                Some(name)
+            } else {
+                args.iter().find_map(find_volatile)
+            }
+        }
+        Expression::Or(args) | Expression::And(args) | Expression::Coalesce(args) => {
+            args.iter().find_map(find_volatile)
+        }
+        Expression::If(condition, yes, no) => [condition, yes, no]
+            .into_iter()
+            .find_map(|expr| find_volatile(expr)),
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_)
+        | Expression::Exists(_) => None,
+    }
+}
+
 const REGEX_SIZE_LIMIT: usize = 1_000_000;
 
 pub trait ExpressionEvaluatorContext<'a> {

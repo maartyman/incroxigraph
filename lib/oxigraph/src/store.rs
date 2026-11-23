@@ -1,12 +1,14 @@
 //! API to access an on-disk [RDF dataset](https://www.w3.org/TR/rdf11-concepts/#dfn-rdf-dataset).
 //!
 //! The entry point of the module is the [`Store`] struct.
+//! For queries that follow committed changes, see
+//! [incremental SPARQL queries](crate::sparql#incremental-queries).
 //!
 //! Usage example:
 //! ```
-//! use oxigraph::model::*;
-//! use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-//! use oxigraph::store::Store;
+//! use incroxigraph::model::*;
+//! use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+//! use incroxigraph::store::Store;
 //!
 //! let store = Store::new()?;
 //!
@@ -66,6 +68,8 @@ use std::thread::available_parallelism;
 /// An on-disk [RDF dataset](https://www.w3.org/TR/rdf11-concepts/#dfn-rdf-dataset).
 /// Allows querying and updating it using SPARQL.
 /// It is based on the [RocksDB](https://rocksdb.org/) key-value store.
+/// See [incremental SPARQL queries](crate::sparql#incremental-queries) to follow committed
+/// changes with a long-lived query.
 ///
 /// This store ensures the "repeatable read" isolation level: the store only exposes changes that have
 /// been "committed" (i.e., no partial writes), and the exposed state does not change for the complete duration
@@ -73,9 +77,9 @@ use std::thread::available_parallelism;
 ///
 /// Usage example:
 /// ```
-/// use oxigraph::model::*;
-/// use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-/// use oxigraph::store::Store;
+/// use incroxigraph::model::*;
+/// use incroxigraph::sparql::{QueryResults, SparqlEvaluator};
+/// use incroxigraph::store::Store;
 ///
 /// let store = Store::new()?;
 ///
@@ -213,8 +217,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let store = Store::new()?;
     ///
@@ -246,8 +250,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let store = Store::new()?;
     ///
@@ -269,8 +273,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), ex);
@@ -292,8 +296,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -315,8 +319,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let store = Store::new()?;
     /// assert!(store.is_empty()?);
@@ -342,8 +346,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -380,8 +384,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let store = Store::new()?;
     /// let a = NamedNode::new("http://example.com/a")?;
@@ -415,9 +419,9 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
-    /// use oxigraph::io::{RdfFormat, RdfParser};
-    /// use oxigraph::model::*;
+    /// use incroxigraph::store::Store;
+    /// use incroxigraph::io::{RdfFormat, RdfParser};
+    /// use incroxigraph::model::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -460,9 +464,9 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
-    /// use oxigraph::io::{RdfParser, RdfFormat};
-    /// use oxigraph::model::*;
+    /// use incroxigraph::store::Store;
+    /// use incroxigraph::io::{RdfParser, RdfFormat};
+    /// use incroxigraph::model::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -503,8 +507,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex, GraphName::DefaultGraph);
@@ -540,8 +544,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex, GraphName::DefaultGraph);
@@ -563,8 +567,8 @@ impl Store {
     /// Dumps the store into a file.
     ///
     /// ```
-    /// use oxigraph::io::RdfFormat;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::io::RdfFormat;
+    /// use incroxigraph::store::Store;
     ///
     /// let file =
     ///     "<http://example.com> <http://example.com> <http://example.com> <http://example.com> .\n";
@@ -596,9 +600,9 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::io::RdfFormat;
-    /// use oxigraph::model::GraphName;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::io::RdfFormat;
+    /// use incroxigraph::model::GraphName;
+    /// use incroxigraph::store::Store;
     ///
     /// let file = "<http://example.com> <http://example.com> <http://example.com> .\n";
     ///
@@ -627,8 +631,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -657,8 +661,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::{NamedNode, Quad};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::{NamedNode, Quad};
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -678,8 +682,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::NamedNode;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::NamedNode;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -705,8 +709,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::{NamedNode, Quad};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::{NamedNode, Quad};
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), ex.clone());
@@ -735,8 +739,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::{NamedNode, Quad};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::{NamedNode, Quad};
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), ex.clone());
@@ -760,8 +764,8 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new("http://example.com")?;
     /// let store = Store::new()?;
@@ -829,9 +833,9 @@ impl Store {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::io::RdfFormat;
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::io::RdfFormat;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let store = Store::new()?;
     ///
@@ -966,8 +970,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let store = Store::new()?;
     /// let a = NamedNode::new("http://example.com/a")?;
@@ -1037,9 +1041,9 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
-    /// use oxigraph::io::{RdfParser, RdfFormat};
-    /// use oxigraph::model::*;
+    /// use incroxigraph::store::Store;
+    /// use incroxigraph::io::{RdfParser, RdfFormat};
+    /// use incroxigraph::model::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1085,9 +1089,9 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
-    /// use oxigraph::io::{RdfParser, RdfFormat};
-    /// use oxigraph::model::*;
+    /// use incroxigraph::store::Store;
+    /// use incroxigraph::io::{RdfParser, RdfFormat};
+    /// use incroxigraph::model::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1131,8 +1135,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new_unchecked("http://example.com");
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex, GraphName::DefaultGraph);
@@ -1142,7 +1146,7 @@ impl<'a> Transaction<'a> {
     /// transaction.insert(quad.clone());
     /// transaction.commit()?;
     /// assert!(store.contains(&quad)?);
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
+    /// # Result::<_,incroxigraph::store::StorageError>::Ok(())
     /// ```
     pub fn insert(&mut self, quad: Quad) {
         self.inner.insert(quad)
@@ -1152,8 +1156,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new_unchecked("http://example.com");
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex, GraphName::DefaultGraph);
@@ -1163,7 +1167,7 @@ impl<'a> Transaction<'a> {
     /// transaction.extend([quad.clone()]);
     /// transaction.commit()?;
     /// assert!(store.contains(&quad)?);
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
+    /// # Result::<_,incroxigraph::store::StorageError>::Ok(())
     /// ```
     pub fn extend(&mut self, quads: impl IntoIterator<Item = Quad>) {
         for quad in quads {
@@ -1175,8 +1179,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new_unchecked("http://example.com");
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex, GraphName::DefaultGraph);
@@ -1186,7 +1190,7 @@ impl<'a> Transaction<'a> {
     /// transaction.remove(&quad);
     /// transaction.commit()?;
     /// assert!(!store.contains(&quad)?);
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
+    /// # Result::<_,incroxigraph::store::StorageError>::Ok(())
     /// ```
     pub fn remove(&mut self, quad: &Quad) {
         self.inner.remove(quad)
@@ -1215,8 +1219,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::NamedNode;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::NamedNode;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new_unchecked("http://example.com");
     /// let store = Store::new()?;
@@ -1227,7 +1231,7 @@ impl<'a> Transaction<'a> {
     ///     store.named_graphs().collect::<Result<Vec<_>, _>>()?,
     ///     vec![ex]
     /// );
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
+    /// # Result::<_,incroxigraph::store::StorageError>::Ok(())
     /// ```
     pub fn insert_named_graph(&mut self, graph_name: impl Into<NamedOrBlankNode>) {
         self.inner.insert_named_graph(graph_name.into())
@@ -1237,8 +1241,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::{NamedNode, Quad};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::{NamedNode, Quad};
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new_unchecked("http://example.com");
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), ex.clone());
@@ -1249,7 +1253,7 @@ impl<'a> Transaction<'a> {
     /// transaction.commit()?;
     /// assert!(store.is_empty()?);
     /// assert_eq!(1, store.named_graphs().count());
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
+    /// # Result::<_,incroxigraph::store::StorageError>::Ok(())
     /// ```
     pub fn clear_graph(&mut self, graph_name: &GraphName) -> Result<(), StorageError> {
         self.inner.clear_graph(graph_name)
@@ -1259,8 +1263,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::{NamedNode, Quad};
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::{NamedNode, Quad};
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new_unchecked("http://example.com");
     /// let quad = Quad::new(ex.clone(), ex.clone(), ex.clone(), ex.clone());
@@ -1271,7 +1275,7 @@ impl<'a> Transaction<'a> {
     /// transaction.commit()?;
     /// assert!(store.is_empty()?);
     /// assert_eq!(0, store.named_graphs().count());
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
+    /// # Result::<_,incroxigraph::store::StorageError>::Ok(())
     /// ```
     pub fn remove_named_graph(
         &mut self,
@@ -1284,8 +1288,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new_unchecked("http://example.com");
     /// let store = Store::new()?;
@@ -1294,7 +1298,7 @@ impl<'a> Transaction<'a> {
     /// transaction.clear()?;
     /// transaction.commit()?;
     /// assert!(store.is_empty()?);
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
+    /// # Result::<_,incroxigraph::store::StorageError>::Ok(())
     /// ```
     pub fn clear(&mut self) -> Result<(), StorageError> {
         self.inner.clear()
@@ -1304,8 +1308,8 @@ impl<'a> Transaction<'a> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::model::*;
-    /// use oxigraph::store::Store;
+    /// use incroxigraph::model::*;
+    /// use incroxigraph::store::Store;
     ///
     /// let ex = NamedNode::new_unchecked("http://example.com");
     /// let store = Store::new()?;
@@ -1313,7 +1317,7 @@ impl<'a> Transaction<'a> {
     /// transaction.insert(Quad::new(ex.clone(), ex.clone(), ex.clone(), ex.clone()));
     /// transaction.commit()?;
     /// assert!(store.contains(&Quad::new(ex.clone(), ex.clone(), ex.clone(), ex))?);
-    /// # Result::<_,oxigraph::store::StorageError>::Ok(())
+    /// # Result::<_,incroxigraph::store::StorageError>::Ok(())
     /// ```
     pub fn commit(self) -> Result<(), StorageError> {
         self.inner.commit()
@@ -1389,9 +1393,9 @@ impl Iterator for GraphNameIter<'_> {
 ///
 /// Usage example a dataset:
 /// ```
-/// use oxigraph::io::RdfFormat;
-/// use oxigraph::model::*;
-/// use oxigraph::store::Store;
+/// use incroxigraph::io::RdfFormat;
+/// use incroxigraph::model::*;
+/// use incroxigraph::store::Store;
 ///
 /// let store = Store::new()?;
 ///
@@ -1497,9 +1501,9 @@ impl BulkLoader<'_> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
-    /// use oxigraph::io::{RdfParser, RdfFormat};
-    /// use oxigraph::model::*;
+    /// use incroxigraph::store::Store;
+    /// use incroxigraph::io::{RdfParser, RdfFormat};
+    /// use incroxigraph::model::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1568,9 +1572,9 @@ impl BulkLoader<'_> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
-    /// use oxigraph::io::{RdfParser, RdfFormat};
-    /// use oxigraph::model::*;
+    /// use incroxigraph::store::Store;
+    /// use incroxigraph::io::{RdfParser, RdfFormat};
+    /// use incroxigraph::model::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1641,9 +1645,9 @@ impl BulkLoader<'_> {
     ///
     /// Usage example:
     /// ```no_run
-    /// use oxigraph::store::Store;
-    /// use oxigraph::io::{RdfParser, RdfFormat};
-    /// use oxigraph::model::*;
+    /// use incroxigraph::store::Store;
+    /// use incroxigraph::io::{RdfParser, RdfFormat};
+    /// use incroxigraph::model::*;
     ///
     /// let store = Store::new()?;
     ///
@@ -1752,9 +1756,9 @@ impl BulkLoader<'_> {
     ///
     /// Usage example:
     /// ```
-    /// use oxigraph::store::Store;
-    /// use oxigraph::io::{RdfParser, RdfFormat};
-    /// use oxigraph::model::*;
+    /// use incroxigraph::store::Store;
+    /// use incroxigraph::io::{RdfParser, RdfFormat};
+    /// use incroxigraph::model::*;
     ///
     /// let store = Store::new()?;
     ///
