@@ -209,7 +209,7 @@ jobs:
         with:
           name: incroxigraph-js-npm
           path: dist
-      - run: npm publish --access public --tag latest dist/incroxigraph-js-*.tgz
+      - run: npm publish --access public --tag latest ./dist/incroxigraph-js-*.tgz
 
   publish_crates:
     if: github.event_name == 'release' && vars.INCROXIGRAPH_RUST_RELEASES_ENABLED == 'true'
